@@ -1,6 +1,11 @@
 [package]
-name = "ziso_compressor"
-version = "0.1.0"
+name = "ziso"
+version = "1.0.0"
 edition = "2024"
+authors = ["Daniel Carrasco"]
+description = "Multithread CSO converter written in Rust"
 
 [dependencies]
+clap = { version = "4.6", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
