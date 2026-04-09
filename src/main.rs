@@ -25,7 +25,7 @@ struct Args {
     /// Input file. Example: game.iso
     input: PathBuf,
 
-    /// Output file. Example: game.cso (optional)
+    /// Output file. Example: game.zso (optional)
     output: Option<PathBuf>,
 
     /// Force to overwrite the output file if exists
@@ -44,7 +44,7 @@ struct Args {
     #[arg(long = "nohc", default_value_t = false)]
     disable_hc: bool,
 
-    /// The size of every block in the CSO file (2048-131072)(recommended 2048 for HDL).
+    /// The size of every block in the ZSO file (2048-131072)(recommended 2048 for HDL).
     #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(2048..=131072))]
     block_size: u32,
 
@@ -96,7 +96,7 @@ fn main() {
         std::process::exit(1)
     });
 
-    trace!("Checking if the input file is an already compressed CSO");
+    trace!("Checking if the input file is an already compressed ZSO");
     let compressed: bool = {
         let mut input_header: [u8; 4] = [0; 4];
 
@@ -107,7 +107,7 @@ fn main() {
                 std::process::exit(1)
             });
 
-        &input_header == b"CISO"
+        &input_header == b"ZISO"
     };
     debug!("Compressed?: {}", compressed);
 
@@ -124,7 +124,7 @@ fn main() {
     let output_filename = args
         .output
         .clone()
-        .unwrap_or_else(|| input_filename.with_extension(if compressed { "iso" } else { "cso" }));
+        .unwrap_or_else(|| input_filename.with_extension(if compressed { "iso" } else { "zso" }));
     debug!("Output file: {:?}", output_filename);
     // Check the output file existence and if must be overwritten
     if (output_filename.exists() && output_filename.is_file()) && !args.force {
@@ -189,9 +189,9 @@ fn compressor(args: &Args, mut input_file: File, mut output_file: File) -> Resul
         }
     };
 
-    // Write the CSO header
+    // Write the ZSO header
     let mut header = [0u8; 24];
-    header[0..4].copy_from_slice(b"CISO"); // Magic string
+    header[0..4].copy_from_slice(b"ZISO"); // Magic string
     header[4..8].copy_from_slice(&24u32.to_le_bytes()); // Header size (always 24)
     header[8..16].copy_from_slice(&input_metadata.len().to_le_bytes()); // Original size without compress
     header[16..20].copy_from_slice(&args.block_size.to_le_bytes()); // Block size
@@ -362,7 +362,7 @@ fn compressor(args: &Args, mut input_file: File, mut output_file: File) -> Resul
 }
 
 fn decompressor(args: &Args, mut input_file: File, mut output_file: File) -> Result<bool, String> {
-    info!("The input file is a CSO file. Decompressing...");
+    info!("The input file is a ZSO file. Decompressing...");
 
     Ok(true)
 }
