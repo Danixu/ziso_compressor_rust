@@ -1,17 +1,21 @@
 use clap::Parser;
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 use std::cmp;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
+// Constants
+const QUEUE_SIZE: usize = 16;
+
 // Message block used to exchange data between threads
 struct MessageBlock {
     id: usize,
+    compressed: bool,
     data: Vec<u8>,
 }
 
@@ -63,11 +67,17 @@ fn main() {
         .init();
 
     // Get the arguments
-    debug!("Getting the program arguments");
+    trace!("Getting the program arguments");
     let args = Args::parse();
+    debug!("Force: {}", args.force);
+    debug!("Threads: {}", args.threads);
+    debug!("Compression level: {}", args.level);
+    debug!("Disable LZ4HC: {}", args.disable_hc);
+    debug!("Block size: {}", args.block_size);
+    debug!("HDL Fix: {}", args.hdl_fix);
 
     // Check the input file existence
-    debug!("Checking if the input file exists.");
+    trace!("Checking if the input file exists.");
     let input_filename = args.input.clone();
     debug!("Input file: {:?}", input_filename);
     if !input_filename.exists() || !input_filename.is_file() {
@@ -77,7 +87,7 @@ fn main() {
         );
         std::process::exit(1);
     }
-    debug!("Opening the input file as File.");
+    trace!("Opening the input file as File.");
     let mut input_file = File::open(&input_filename).unwrap_or_else(|e| {
         error!(
             "Fatal error: The input file '{:?}' cannot be readed: {}",
@@ -86,23 +96,31 @@ fn main() {
         std::process::exit(1)
     });
 
-    debug!("Checking if the input file is an already compressed CSO");
+    trace!("Checking if the input file is an already compressed CSO");
     let compressed: bool = {
         let mut input_header: [u8; 4] = [0; 4];
 
         input_file
             .read_exact(&mut input_header)
             .unwrap_or_else(|e| {
-                error!("Fatal error: Cannot read the input file header");
+                error!("Fatal error: Cannot read the input file header: {}", e);
                 std::process::exit(1)
             });
 
         &input_header == b"CISO"
     };
-    debug!("It's compressed?: {}", compressed);
+    debug!("Compressed?: {}", compressed);
+
+    trace!("Rewind the file to the start point");
+    let _ = input_file
+        .seek(std::io::SeekFrom::Start(0))
+        .unwrap_or_else(|e| {
+            error!("Fatal error: Cannot rewind the input file: {}", e);
+            std::process::exit(1)
+        });
 
     // If the output is empty, then generate the filename based in the input
-    debug!("Checking if the output file exists");
+    trace!("Checking if the output file exists");
     let output_filename = args
         .output
         .clone()
@@ -116,8 +134,8 @@ fn main() {
         );
         std::process::exit(1);
     }
-    debug!("Opening the output file as File in write mode and truncate");
-    let mut output_file = OpenOptions::new()
+    trace!("Opening the output file as File in write mode and truncate");
+    let output_file = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
@@ -130,15 +148,17 @@ fn main() {
             std::process::exit(1)
         });
     if compressed {
-        info!("The input file is a CSO file. Decompressing...");
+        let _ = decompressor(&args, input_file, output_file);
     } else {
-        info!("The input file is a image file. Compressing...");
         let _ = compressor(&args, input_file, output_file);
     }
     ()
 }
 
 fn compressor(args: &Args, mut input_file: File, mut output_file: File) -> Result<bool, String> {
+    info!("The input file is a image file. Compressing...");
+
+    trace!("Gettint input metadata");
     let input_metadata = input_file.metadata().unwrap_or_else(|e| {
         error!("Error reading the input file metadata: {}", e);
         std::process::exit(1)
@@ -148,9 +168,26 @@ fn compressor(args: &Args, mut input_file: File, mut output_file: File) -> Resul
     let total_blocks: usize =
         (input_metadata.len() as usize + (args.block_size - 1) as usize) / args.block_size as usize;
     debug!("Number of blocks: {:?}", total_blocks);
+    debug!("Last block size: {:?}", {
+        if (input_metadata.len() % args.block_size as u64) == 0 {
+            args.block_size as u64
+        } else {
+            input_metadata.len() % args.block_size as u64
+        }
+    });
 
     // Index table
-    let mut index_table: Vec<u32> = vec![0; total_blocks as usize + 1];
+    let mut index_table: Vec<u32> = vec![0; total_blocks + 1];
+
+    let pos_shift: u8 = {
+        match input_metadata.len() {
+            0_u64..0x7FFFFFFF_u64 => 0,
+            0x7FFFFFFF_u64..0xFFFFFFFF_u64 => 1,
+            0xFFFFFFFF_u64..0x1FFFFFFFF_u64 => 2,
+            0x1FFFFFFFF_u64..0x3FFFFFFFF_u64 => 3,
+            0x3FFFFFFFF_u64..=u64::MAX => 4,
+        }
+    };
 
     // Write the CSO header
     let mut header = [0u8; 24];
@@ -159,41 +196,48 @@ fn compressor(args: &Args, mut input_file: File, mut output_file: File) -> Resul
     header[8..16].copy_from_slice(&input_metadata.len().to_le_bytes()); // Original size without compress
     header[16..20].copy_from_slice(&args.block_size.to_le_bytes()); // Block size
     header[20] = 1; // Format version (v1)
-    header[21] = 0; // Index alignment
+    header[21] = pos_shift; // Index alignment
     // The 22th and 23th bytes are reserved
 
+    // Write the header
     let _ = output_file.write_all(&header);
+
+    // Write the empty index to reserve the space
+    let _ = output_file
+        .seek(SeekFrom::Current(((total_blocks + 1) * 4) as i64))
+        .unwrap();
 
     // A way to stop all the threads if any of them has failed
     let kill_switch = Arc::new(AtomicBool::new(false));
 
-    Ok(true)
-}
-/*
-fn main() {
-    // Usamos sync_channel para poner un límite.
+    // Using sync_channel to limit the number of items
     // Si hay 100 bloques en la cola, el que intente enviar se pausará.
-    let (tx_in, rx_in) = mpsc::sync_channel::<Block>(16);
-    let (tx_out, rx_out) = mpsc::sync_channel::<Block>(16);
+    let (tx_in, rx_in) = mpsc::sync_channel::<MessageBlock>(QUEUE_SIZE);
+    let (tx_out, rx_out) = mpsc::sync_channel::<MessageBlock>(QUEUE_SIZE);
 
-    // Como varios workers van a leer de rx_in, necesitamos protegerlo con un Mutex.
-    // Arc (Atomic Reference Counting) nos permite compartirlo entre los hilos de forma segura.
+    // Protect the rx_in with a mutex to allow multiple workers to read from it.
+    // Arc (Atomic Reference Counting) allows to share it between threads securely.
     let shared_rx_in = Arc::new(Mutex::new(rx_in));
 
-    let num_workers = 4; // Puedes ajustarlo al número de núcleos físicos que tengas
+    // Initialize the workers (compression threads)
     let mut workers = vec![];
-
-    // 2. Iniciar los Trabajadores (Hilos Compresores)
-    for _ in 0..num_workers {
+    for _ in 0..args.threads {
         let rx = Arc::clone(&shared_rx_in);
         let tx = tx_out.clone();
+        // Clone the kill_switch
+        let worker_kill_switch = kill_switch.clone();
 
         let worker = thread::spawn(move || {
             loop {
-                // Tomamos el lock de la cola, sacamos un bloque y soltamos el lock inmediatamente
+                // If the kill_switch was activated, break the loop
+                if worker_kill_switch.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                // Get the lock, pull a block and drop the lock immediately.
                 let block_opt = {
                     let lock = rx.lock().unwrap();
-                    lock.recv().ok() // ok() devuelve None si la cola se ha cerrado (fin de archivo)
+                    lock.recv().ok() // ok() returns None if the queue was closed (EOF).
                 };
 
                 match block_opt {
@@ -207,9 +251,10 @@ fn main() {
                         //);
                         let compressed_data = block.data;
 
-                        // Enviamos el resultado a la cola de salida
-                        tx.send(Block {
+                        // Send the compressed data to the output queue to be processed by the writer.
+                        tx.send(MessageBlock {
                             id: block.id,
+                            compressed: false,
                             data: compressed_data,
                         })
                         .unwrap();
@@ -221,11 +266,12 @@ fn main() {
         workers.push(worker);
     }
 
-    // Importante: El hilo principal suelta su copia del transmisor de salida.
-    // Así, el hilo Escritor sabrá que ya no quedan más datos cuando los workers terminen.
+    // Drop the output queue. This will allow the writer to detect when there's no more data.
     drop(tx_out);
 
-    // 3. Iniciar el Productor (Hilo Lector)
+    // Clone the kill_switch
+    let reader_kill_switch = Arc::clone(&kill_switch);
+    // Initialize the reader thread
     let reader_thread = thread::spawn(move || {
         let mut file = File::open("test.bin").expect("There was an error reading the file");
         let file_size = file
@@ -237,14 +283,26 @@ fn main() {
         let mut id = 0;
 
         while read_bytes_left > 0 {
+            // If the kill_switch was activated, break the loop
+            if reader_kill_switch.load(Ordering::Relaxed) {
+                break;
+            }
+
             let to_read: usize = cmp::min(read_bytes_left as usize, 2048000);
             let mut data = vec![0; to_read];
+            let compressed: bool = false;
 
             //println!("Reading the {} block with a size of {}", id, to_read);
             let _ = file.read_exact(&mut data);
 
             // Si la cola está llena (100 elementos), send() pausará este hilo automáticamente
-            tx_in.send(Block { id, data }).unwrap();
+            tx_in
+                .send(MessageBlock {
+                    id,
+                    compressed,
+                    data,
+                })
+                .unwrap();
 
             id += 1;
             read_bytes_left = file_size
@@ -254,47 +312,57 @@ fn main() {
         }
     });
 
-    // 4. Iniciar el Consumidor (Hilo Escritor)
+    // Clone the kill_switch
+    let reader_kill_switch = Arc::clone(&kill_switch);
+    // Initialize the writter
     let writer_thread = thread::spawn(move || {
         let mut expected_id = 0;
-        // Búfer temporal para bloques que llegaron antes de tiempo (desordenados)
+        // Temporal buffer for the block ordering
         let mut out_of_order_buffer: HashMap<usize, Vec<u8>> = HashMap::new();
 
         let mut file =
             File::create("test.out").expect("There was an error opening the output file");
 
-        // El for loop sobre rx_out lee continuamente y se pausa si no hay datos.
-        // Termina solo cuando todos los workers han cerrado su 'tx_out'.
+        // The loop works until all the workers tx_out are closed, pausing when there is no data.
         for block in rx_out {
+            // If the kill_switch was activated, break the loop
+            if reader_kill_switch.load(Ordering::Relaxed) {
+                break;
+            }
+
+            // Check if the received block is the expected one
             if block.id == expected_id {
-                // Es el bloque que esperábamos. Lo escribimos.
-                // AQUÍ VA TU LÓGICA DE ESCRITURA EN DISCO
-                //println!("Escribiendo bloque a disco: {}", expected_id);
+                // If the order matches then write it to the file
                 let _ = file.write_all(&block.data);
                 expected_id += 1;
 
-                // Ahora comprobamos si los siguientes bloques ya estaban esperando en el búfer
+                // Check if the next blocks are in the ordering buffer
                 while let Some(buffered_data) = out_of_order_buffer.remove(&expected_id) {
-                    // AQUÍ VA TU LÓGICA DE ESCRITURA EN DISCO (del dato guardado en memoria)
-                    //println!("Escribiendo bloque desde memoria: {}", expected_id);
+                    // If the next block was waiting in the buffer, then write it into the file
                     let _ = file.write_all(&buffered_data);
                     expected_id += 1;
                 }
             } else {
-                // El bloque llegó antes de su turno (por ejemplo, llegó el 3 pero esperamos el 2).
-                // Lo guardamos en el diccionario temporal de memoria.
+                // If the block doesn't matches the expected block then store it in the ordering buffer.
                 out_of_order_buffer.insert(block.id, block.data);
             }
         }
     });
 
-    // 5. Esperar a que todo termine limpiamente
+    // Wait for every thread and then finalize the program
     reader_thread.join().unwrap();
     for w in workers {
         w.join().unwrap();
     }
     writer_thread.join().unwrap();
 
-    println!("¡Compresión finalizada con éxito!");
+    info!("File compressed succesfully!");
+
+    Ok(true)
 }
-*/
+
+fn decompressor(args: &Args, mut input_file: File, mut output_file: File) -> Result<bool, String> {
+    info!("The input file is a CSO file. Decompressing...");
+
+    Ok(true)
+}
