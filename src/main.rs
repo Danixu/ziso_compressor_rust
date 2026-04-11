@@ -11,6 +11,7 @@ use std::thread;
 
 // Constants
 const QUEUE_SIZE: usize = 16;
+const QUEUE_TRANSFER_SIZE: usize = 1048576;
 
 // Message block used to exchange data between threads
 struct MessageBlock {
@@ -63,11 +64,29 @@ fn default_threads() -> usize {
 fn main() {
     // Initialize the logger
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format_timestamp_millis()
+        .format(|buf, record| {
+            // Obtenemos el hilo actual que está emitiendo el log
+            let current_thread = thread::current();
+            // Intentamos sacar el nombre. Si no tiene (como el main), ponemos "Main"
+            let thread_name = current_thread.name().unwrap_or("Main");
+            // 1. Extraemos el nivel de log con sus colores ANSI originales
+            let style = buf.default_level_style(record.level());
+
+            writeln!(
+                buf,
+                "[{}] [{:<10}] [{}{:<5}{:#}] {}",
+                buf.timestamp_millis(),
+                thread_name,
+                style,
+                record.level(),
+                style,
+                record.args()
+            )
+        })
         .init();
 
     // Get the arguments
-    trace!("Getting the program arguments");
+    debug!("Getting the program arguments");
     let args = Args::parse();
     debug!("Force: {}", args.force);
     debug!("Threads: {}", args.threads);
@@ -77,17 +96,17 @@ fn main() {
     debug!("HDL Fix: {}", args.hdl_fix);
 
     // Check the input file existence
-    trace!("Checking if the input file exists.");
+    debug!("Checking if the input file exists");
     let input_filename = args.input.clone();
     debug!("Input file: {:?}", input_filename);
     if !input_filename.exists() || !input_filename.is_file() {
         error!(
-            "The input file {:?} doesn't exists or is not valid.",
+            "The input file {:?} doesn't exists or is not valid",
             input_filename
         );
         std::process::exit(1);
     }
-    trace!("Opening the input file as File.");
+    debug!("Opening the input file as File");
     let mut input_file = File::open(&input_filename).unwrap_or_else(|e| {
         error!(
             "Fatal error: The input file '{:?}' cannot be readed: {}",
@@ -96,7 +115,7 @@ fn main() {
         std::process::exit(1)
     });
 
-    trace!("Checking if the input file is an already compressed ZSO");
+    debug!("Checking if the input file is an already compressed ZSO");
     let compressed: bool = {
         let mut input_header: [u8; 4] = [0; 4];
 
@@ -106,6 +125,8 @@ fn main() {
                 error!("Fatal error: Cannot read the input file header: {}", e);
                 std::process::exit(1)
             });
+
+        trace!("Input file header: {:?}", &input_header);
 
         &input_header == b"ZISO"
     };
@@ -120,7 +141,7 @@ fn main() {
         });
 
     // If the output is empty, then generate the filename based in the input
-    trace!("Checking if the output file exists");
+    debug!("Checking if the output file exists");
     let output_filename = args
         .output
         .clone()
@@ -129,12 +150,12 @@ fn main() {
     // Check the output file existence and if must be overwritten
     if (output_filename.exists() && output_filename.is_file()) && !args.force {
         error!(
-            "The output file {:?} exists and no force flag was provided.",
+            "The output file {:?} exists and no force flag was provided",
             output_filename
         );
         std::process::exit(1);
     }
-    trace!("Opening the output file as File in write mode and truncate");
+    debug!("Opening the output file as File in write mode and truncate");
     let output_file = OpenOptions::new()
         .write(true)
         .create(true)
@@ -158,7 +179,7 @@ fn main() {
 fn compressor(args: &Args, mut input_file: File, mut output_file: File) -> Result<bool, String> {
     info!("The input file is a image file. Compressing...");
 
-    trace!("Gettint input metadata");
+    debug!("Gettint input metadata");
     let input_metadata = input_file.metadata().unwrap_or_else(|e| {
         error!("Error reading the input file metadata: {}", e);
         std::process::exit(1)
@@ -177,19 +198,23 @@ fn compressor(args: &Args, mut input_file: File, mut output_file: File) -> Resul
     });
 
     // Index table
+    trace!("Generating the index data");
     let mut index_table: Vec<u32> = vec![0; total_blocks + 1];
 
+    // The position shift required to store the block position for bigger files
     let pos_shift: u8 = {
         match input_metadata.len() {
-            0_u64..0x7FFFFFFF_u64 => 0,
-            0x7FFFFFFF_u64..0xFFFFFFFF_u64 => 1,
-            0xFFFFFFFF_u64..0x1FFFFFFFF_u64 => 2,
-            0x1FFFFFFFF_u64..0x3FFFFFFFF_u64 => 3,
-            0x3FFFFFFFF_u64..=u64::MAX => 4,
+            0_u64..0x7FFFFFFF_u64 => 0, // PSP games, CD-ROM games and some small DVD games (below 2GB)
+            0x7FFFFFFF_u64..0xFFFFFFFF_u64 => 1, // Most of the rest of the DVD games (below 4GB)
+            0xFFFFFFFF_u64..0x1FFFFFFFF_u64 => 2, // Almost all the double layer DVD games (below 8GB)
+            0x1FFFFFFFF_u64..0x3FFFFFFFF_u64 => 3, // Rare double layer DVD games (between 8GB and 16GB)
+            0x3FFFFFFFF_u64..=u64::MAX => 4, // Above 16GB. There are no CD-ROM or DVD-ROM with this size.
         }
     };
+    debug!("The index shifting will be {} for this iso", pos_shift);
 
     // Write the ZSO header
+    debug!("Generating the ZSO header");
     let mut header = [0u8; 24];
     header[0..4].copy_from_slice(b"ZISO"); // Magic string
     header[4..8].copy_from_slice(&24u32.to_le_bytes()); // Header size (always 24)
@@ -198,11 +223,14 @@ fn compressor(args: &Args, mut input_file: File, mut output_file: File) -> Resul
     header[20] = 1; // Format version (v1)
     header[21] = pos_shift; // Index alignment
     // The 22th and 23th bytes are reserved
+    trace!("ZSO Header {:?}", &header);
 
     // Write the header
+    debug!("Writting the ZSO header into the output file");
     let _ = output_file.write_all(&header);
 
     // Write the empty index to reserve the space
+    debug!("Reserving the index data space in the output file");
     let _ = output_file
         .seek(SeekFrom::Current(((total_blocks + 1) * 4) as i64))
         .unwrap();
@@ -210,8 +238,11 @@ fn compressor(args: &Args, mut input_file: File, mut output_file: File) -> Resul
     // A way to stop all the threads if any of them has failed
     let kill_switch = Arc::new(AtomicBool::new(false));
 
+    // Number of blocks to be transfer in each queue object
+    let queue_blocks_number: usize = QUEUE_TRANSFER_SIZE / args.block_size as usize;
+
     // Using sync_channel to limit the number of items
-    // Si hay 100 bloques en la cola, el que intente enviar se pausará.
+    // Threads will wait until there's space on the queue.
     let (tx_in, rx_in) = mpsc::sync_channel::<MessageBlock>(QUEUE_SIZE);
     let (tx_out, rx_out) = mpsc::sync_channel::<MessageBlock>(QUEUE_SIZE);
 
@@ -220,141 +251,180 @@ fn compressor(args: &Args, mut input_file: File, mut output_file: File) -> Resul
     let shared_rx_in = Arc::new(Mutex::new(rx_in));
 
     // Initialize the workers (compression threads)
+    debug!("Initializing the workers");
     let mut workers = vec![];
-    for _ in 0..args.threads {
+    for i in 0..args.threads {
         let rx = Arc::clone(&shared_rx_in);
         let tx = tx_out.clone();
         // Clone the kill_switch
         let worker_kill_switch = kill_switch.clone();
 
-        let worker = thread::spawn(move || {
-            loop {
-                // If the kill_switch was activated, break the loop
-                if worker_kill_switch.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                // Get the lock, pull a block and drop the lock immediately.
-                let block_opt = {
-                    let lock = rx.lock().unwrap();
-                    lock.recv().ok() // ok() returns None if the queue was closed (EOF).
-                };
-
-                match block_opt {
-                    Some(block) => {
-                        // AQUÍ VA TU LÓGICA DE LZ4:
-                        // let compressed = lz4::compress(&block.data);
-                        //println!(
-                        //    "Processing the block {} with a size of {}",
-                        //    block.id,
-                        //    block.data.len()
-                        //);
-                        let compressed_data = block.data;
-
-                        // Send the compressed data to the output queue to be processed by the writer.
-                        tx.send(MessageBlock {
-                            id: block.id,
-                            compressed: false,
-                            data: compressed_data,
-                        })
-                        .unwrap();
+        debug!("Spawning the new thread");
+        let worker: Result<thread::JoinHandle<()>, std::io::Error> = thread::Builder::new()
+            .name(format!("Worker-{}", i))
+            .spawn(move || {
+                loop {
+                    // If the kill_switch was activated, break the loop
+                    if worker_kill_switch.load(Ordering::Relaxed) {
+                        debug!("Kill switch activated. Breaking the loop.");
+                        break;
                     }
-                    None => break, // El canal se cerró, el worker termina su trabajo
+
+                    // Get the lock, pull a block and drop the lock immediately.
+                    debug!("Getting a new rx message");
+                    let block_opt = {
+                        trace!("Getting the rx lock");
+                        let lock = rx.lock().unwrap();
+                        trace!("Pulling the rx queue message");
+                        lock.recv().ok() // ok() returns None if the queue was closed (EOF).
+                    };
+
+                    match block_opt {
+                        Some(block) => {
+                            debug!("Received a message. Processing...");
+                            // AQUÍ VA TU LÓGICA DE LZ4:
+                            // let compressed = lz4::compress(&block.data);
+                            //println!(
+                            //    "Processing the block {} with a size of {}",
+                            //    block.id,
+                            //    block.data.len()
+                            //);
+                            let compressed_data = block.data;
+
+                            // Send the compressed data to the output queue to be processed by the writer.
+                            tx.send(MessageBlock {
+                                id: block.id,
+                                compressed: false,
+                                data: compressed_data,
+                            })
+                            .unwrap();
+                        }
+                        None => {
+                            debug!(
+                                "There are no more messages in the queue. Closing the thread..."
+                            );
+                            break; // The reading channel was closed so the worker stops
+                        }
+                    }
                 }
-            }
-        });
-        workers.push(worker);
+            });
+        if worker.is_err() {
+            error!("There was an error creating the workers threads!");
+            kill_switch.store(true, Ordering::Relaxed);
+        }
+        workers.push(worker.unwrap());
     }
 
-    // Drop the output queue. This will allow the writer to detect when there's no more data.
+    // Drop the output queue. This will allow the writer to detect when there's no more data (workers will drop the tx_out too).
     drop(tx_out);
 
     // Clone the kill_switch
     let reader_kill_switch = Arc::clone(&kill_switch);
     // Initialize the reader thread
-    let reader_thread = thread::spawn(move || {
-        let mut file = File::open("test.bin").expect("There was an error reading the file");
-        let file_size = file
-            .metadata()
-            .expect("There was an error getting the file info")
-            .len();
-        println!("Tamaño total del archivo: {} bytes", file_size);
-        let mut read_bytes_left = file_size;
-        let mut id = 0;
+    let reader_thread = thread::Builder::new()
+        .name("Reader".to_string())
+        .spawn(move || {
+            let file_size = input_file
+                .metadata()
+                .expect("There was an error getting the file info")
+                .len();
+            debug!("Total input file size: {} bytes", file_size);
+            let mut read_bytes_left = file_size;
+            let mut id = 0;
 
-        while read_bytes_left > 0 {
-            // If the kill_switch was activated, break the loop
-            if reader_kill_switch.load(Ordering::Relaxed) {
-                break;
+            while read_bytes_left > 0 {
+                // If the kill_switch was activated, break the loop
+                if reader_kill_switch.load(Ordering::Relaxed) {
+                    debug!("Kill switch activated. Breaking the loop.");
+                    break;
+                }
+
+                let to_read: usize = cmp::min(read_bytes_left as usize, 2048000);
+                let mut data = vec![0; to_read];
+                let compressed: bool = false;
+
+                //println!("Reading the {} block with a size of {}", id, to_read);
+                let _ = input_file.read_exact(&mut data);
+
+                // Si la cola está llena (100 elementos), send() pausará este hilo automáticamente
+                tx_in
+                    .send(MessageBlock {
+                        id,
+                        compressed,
+                        data,
+                    })
+                    .unwrap();
+
+                id += 1;
+                read_bytes_left = file_size
+                    - input_file
+                        .stream_position()
+                        .expect("There was an erorr getting the stream pos");
             }
+        });
 
-            let to_read: usize = cmp::min(read_bytes_left as usize, 2048000);
-            let mut data = vec![0; to_read];
-            let compressed: bool = false;
-
-            //println!("Reading the {} block with a size of {}", id, to_read);
-            let _ = file.read_exact(&mut data);
-
-            // Si la cola está llena (100 elementos), send() pausará este hilo automáticamente
-            tx_in
-                .send(MessageBlock {
-                    id,
-                    compressed,
-                    data,
-                })
-                .unwrap();
-
-            id += 1;
-            read_bytes_left = file_size
-                - file
-                    .stream_position()
-                    .expect("There was an erorr getting the stream pos");
-        }
-    });
+    if reader_thread.is_err() {
+        error!("There was an error creating the reader thread!");
+        kill_switch.store(true, Ordering::Relaxed);
+    }
 
     // Clone the kill_switch
     let reader_kill_switch = Arc::clone(&kill_switch);
     // Initialize the writter
-    let writer_thread = thread::spawn(move || {
-        let mut expected_id = 0;
-        // Temporal buffer for the block ordering
-        let mut out_of_order_buffer: HashMap<usize, Vec<u8>> = HashMap::new();
+    let writer_thread = thread::Builder::new()
+        .name("Writer".to_string())
+        .spawn(move || {
+            let mut expected_id = 0;
+            // Temporal buffer for the block ordering
+            let mut out_of_order_buffer: HashMap<usize, MessageBlock> = HashMap::new();
 
-        let mut file =
-            File::create("test.out").expect("There was an error opening the output file");
+            let mut file =
+                File::create("test.out").expect("There was an error opening the output file");
 
-        // The loop works until all the workers tx_out are closed, pausing when there is no data.
-        for block in rx_out {
-            // If the kill_switch was activated, break the loop
-            if reader_kill_switch.load(Ordering::Relaxed) {
-                break;
-            }
-
-            // Check if the received block is the expected one
-            if block.id == expected_id {
-                // If the order matches then write it to the file
-                let _ = file.write_all(&block.data);
-                expected_id += 1;
-
-                // Check if the next blocks are in the ordering buffer
-                while let Some(buffered_data) = out_of_order_buffer.remove(&expected_id) {
-                    // If the next block was waiting in the buffer, then write it into the file
-                    let _ = file.write_all(&buffered_data);
-                    expected_id += 1;
+            // The loop works until all the workers tx_out are closed, pausing when there is no data.
+            for block in rx_out {
+                // If the kill_switch was activated, break the loop
+                if reader_kill_switch.load(Ordering::Relaxed) {
+                    debug!("Kill switch activated. Breaking the loop.");
+                    break;
                 }
-            } else {
-                // If the block doesn't matches the expected block then store it in the ordering buffer.
-                out_of_order_buffer.insert(block.id, block.data);
+
+                // Check if the received block is the expected one
+                if block.id == expected_id {
+                    debug!("Writing the block {} from queue", expected_id);
+                    // If the order matches then write it to the file
+                    let _ = file.write_all(&block.data);
+                    expected_id += 1;
+
+                    // Check if the next blocks are in the ordering buffer
+                    while let Some(buffered_data) = out_of_order_buffer.remove(&expected_id) {
+                        debug!("Writing the block {} from the buffer", expected_id);
+                        // If the next block was waiting in the buffer, then write it into the file
+                        let _ = file.write_all(&buffered_data.data);
+                        expected_id += 1;
+                    }
+                } else {
+                    debug!(
+                        "The received block ({}) was not expected right now (expected: {})",
+                        block.id, expected_id
+                    );
+                    // If the block doesn't matches the expected block then store it in the ordering buffer.
+                    out_of_order_buffer.insert(block.id, block);
+                }
             }
-        }
-    });
+        });
+
+    if writer_thread.is_err() {
+        error!("There was an error creating the writer thread!");
+        kill_switch.store(true, Ordering::Relaxed);
+    }
 
     // Wait for every thread and then finalize the program
-    reader_thread.join().unwrap();
+    reader_thread.unwrap().join().unwrap();
     for w in workers {
         w.join().unwrap();
     }
-    writer_thread.join().unwrap();
+    writer_thread.unwrap().join().unwrap();
 
     info!("File compressed succesfully!");
 
