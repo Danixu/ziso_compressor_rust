@@ -306,6 +306,10 @@ fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Result
                                     &message.data[(i * args.block_size as usize)
                                         ..((i + 1) * args.block_size as usize)],
                                 );
+
+                                // TODO: Must be changed once the logic is done
+                                out_message.blocksize[i] = args.block_size;
+                                out_message.compressed[i] = false;
                             }
 
                             // Send the compressed data to the output queue to be processed by the writer.
