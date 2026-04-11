@@ -11,16 +11,17 @@ use std::thread;
 
 // Constants
 const QUEUE_SIZE: usize = 16;
-const QUEUE_TRANSFER_SIZE: usize = 1048576;
+const QUEUE_TRANSFER_SIZE: usize = 2 * 1024 * 1024;
 
 // Message block used to exchange data between threads
 struct MessageBlock {
     id: usize,
-    compressed: bool,
+    compressed: Vec<bool>,
+    blocksize: Vec<u32>,
     data: Vec<u8>,
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Input file. Example: game.iso
@@ -169,14 +170,14 @@ fn main() {
             std::process::exit(1)
         });
     if compressed {
-        let _ = decompressor(&args, input_file, output_file);
+        let _ = decompressor(args, input_file, output_file);
     } else {
-        let _ = compressor(&args, input_file, output_file);
+        let _ = compressor(args, input_file, output_file);
     }
     ()
 }
 
-fn compressor(args: &Args, mut input_file: File, mut output_file: File) -> Result<bool, String> {
+fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Result<bool, String> {
     info!("The input file is a image file. Compressing...");
 
     debug!("Gettint input metadata");
@@ -238,8 +239,10 @@ fn compressor(args: &Args, mut input_file: File, mut output_file: File) -> Resul
     // A way to stop all the threads if any of them has failed
     let kill_switch = Arc::new(AtomicBool::new(false));
 
-    // Number of blocks to be transfer in each queue object
-    let queue_blocks_number: usize = QUEUE_TRANSFER_SIZE / args.block_size as usize;
+    // We get the real number of bytes to read. In case that the block_size is modified, it can differ from the QUEUE_TRANSFER_SIZE.
+    // 1MB / 2KB = 512, but 1MB / 3KB = 341,33333... and partial blocks must not be read.
+    let queue_real_size: usize =
+        QUEUE_TRANSFER_SIZE - (QUEUE_TRANSFER_SIZE % args.block_size as usize);
 
     // Using sync_channel to limit the number of items
     // Threads will wait until there's space on the queue.
@@ -272,32 +275,47 @@ fn compressor(args: &Args, mut input_file: File, mut output_file: File) -> Resul
 
                     // Get the lock, pull a block and drop the lock immediately.
                     debug!("Getting a new rx message");
-                    let block_opt = {
+                    let message_opt = {
                         trace!("Getting the rx lock");
                         let lock = rx.lock().unwrap();
                         trace!("Pulling the rx queue message");
                         lock.recv().ok() // ok() returns None if the queue was closed (EOF).
                     };
 
-                    match block_opt {
-                        Some(block) => {
+                    match message_opt {
+                        Some(message) => {
                             debug!("Received a message. Processing...");
-                            // AQUÍ VA TU LÓGICA DE LZ4:
-                            // let compressed = lz4::compress(&block.data);
-                            //println!(
-                            //    "Processing the block {} with a size of {}",
-                            //    block.id,
-                            //    block.data.len()
-                            //);
-                            let compressed_data = block.data;
+
+                            // Determine the number of received blocks
+                            let blocks_number: usize = (message.data.len()
+                                + (args.block_size as usize - 1))
+                                / args.block_size as usize;
+
+                            // Processing the data block by block
+                            debug!("Processing {} blocks", blocks_number);
+                            let mut out_message = MessageBlock {
+                                id: message.id,
+                                compressed: vec![false; blocks_number],
+                                blocksize: vec![0; blocks_number],
+                                data: Vec::new(),
+                            };
+                            for i in 0..blocks_number {
+                                trace!("Working on block {}", i);
+                                // TODO: Compress to LZ4 using the args
+                                out_message.data.extend_from_slice(
+                                    &message.data[(i * args.block_size as usize)
+                                        ..((i + 1) * args.block_size as usize)],
+                                );
+                            }
 
                             // Send the compressed data to the output queue to be processed by the writer.
-                            tx.send(MessageBlock {
-                                id: block.id,
-                                compressed: false,
-                                data: compressed_data,
-                            })
-                            .unwrap();
+                            let sent = tx.send(out_message);
+                            if sent.is_err() {
+                                error!(
+                                    "There was an error sending the processed data to the writer"
+                                );
+                                worker_kill_switch.store(true, Ordering::Relaxed);
+                            }
                         }
                         None => {
                             debug!(
@@ -339,19 +357,24 @@ fn compressor(args: &Args, mut input_file: File, mut output_file: File) -> Resul
                     break;
                 }
 
-                let to_read: usize = cmp::min(read_bytes_left as usize, 2048000);
+                let to_read: usize = cmp::min(read_bytes_left as usize, queue_real_size);
                 let mut data = vec![0; to_read];
                 let compressed: bool = false;
 
-                //println!("Reading the {} block with a size of {}", id, to_read);
+                debug!("Reading the {} block with a size of {}", id, to_read);
                 let _ = input_file.read_exact(&mut data);
+
+                // Determine the number of received blocks
+                let blocks_number: usize =
+                    (to_read + (args.block_size as usize - 1)) / args.block_size as usize;
 
                 // Si la cola está llena (100 elementos), send() pausará este hilo automáticamente
                 tx_in
                     .send(MessageBlock {
-                        id,
-                        compressed,
-                        data,
+                        id: id,
+                        compressed: vec![false; blocks_number],
+                        blocksize: vec![args.block_size; blocks_number],
+                        data: data,
                     })
                     .unwrap();
 
@@ -431,7 +454,7 @@ fn compressor(args: &Args, mut input_file: File, mut output_file: File) -> Resul
     Ok(true)
 }
 
-fn decompressor(args: &Args, mut input_file: File, mut output_file: File) -> Result<bool, String> {
+fn decompressor(args: Args, mut input_file: File, mut output_file: File) -> Result<bool, String> {
     info!("The input file is a ZSO file. Decompressing...");
 
     Ok(true)
