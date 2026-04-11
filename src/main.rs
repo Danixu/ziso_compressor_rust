@@ -1,5 +1,6 @@
 use clap::Parser;
 use log::{debug, error, info, trace, warn};
+use lzzzz::{lz4, lz4_hc};
 use std::cmp;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -39,8 +40,8 @@ struct Args {
     threads: usize,
 
     /// LZ4 compression level (1-12)
-    #[arg(short = 'l', long, default_value_t = 12, value_parser = clap::value_parser!(u8).range(1..=12))]
-    level: u8,
+    #[arg(short = 'l', long, default_value_t = 12, value_parser = clap::value_parser!(i32).range(1..=12))]
+    level: i32,
 
     /// Disable the LZ4HC compression
     #[arg(long = "nohc", default_value_t = false)]
@@ -266,6 +267,9 @@ fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Result
         let worker: Result<thread::JoinHandle<()>, std::io::Error> = thread::Builder::new()
             .name(format!("Worker-{}", i))
             .spawn(move || {
+                let mut comp_buffer = vec![0u8; lz4::max_compressed_size(args.block_size as usize)];
+                let lz4_acceleration = lz4::ACC_LEVEL_DEFAULT;
+
                 loop {
                     // If the kill_switch was activated, break the loop
                     if worker_kill_switch.load(Ordering::Relaxed) {
@@ -301,15 +305,42 @@ fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Result
                             };
                             for i in 0..blocks_number {
                                 trace!("Working on block {}", i);
-                                // TODO: Compress to LZ4 using the args
-                                out_message.data.extend_from_slice(
-                                    &message.data[(i * args.block_size as usize)
-                                        ..((i + 1) * args.block_size as usize)],
-                                );
+                                // Reference the block
+                                let raw_block: &[u8] = &message.data[(i * args.block_size as usize)
+                                    ..((i + 1) * args.block_size as usize)];
 
-                                // TODO: Must be changed once the logic is done
-                                out_message.blocksize[i] = args.block_size;
-                                out_message.compressed[i] = false;
+                                // Compress the block
+                                let res = if args.disable_hc {
+                                    lz4::compress(raw_block, &mut comp_buffer, lz4_acceleration)
+                                } else {
+                                    lz4_hc::compress(raw_block, &mut comp_buffer, args.level)
+                                };
+
+                                match res {
+                                    // Ok(size) significa que cabía en el buffer.
+                                    // Además, verificamos que realmente ocupe MENOS que el original (2048).
+                                    Ok(comp_size) if comp_size < args.block_size as usize => {
+                                        // Hacemos un .to_vec() solo del trozo válido para enviarlo por el canal
+                                        out_message
+                                            .data
+                                            .extend_from_slice(&comp_buffer[..comp_size]);
+                                        out_message.compressed[i] = true;
+                                        out_message.blocksize[i] = comp_size as u32;
+                                    }
+
+                                    // El guion bajo (_) captura TODO LO DEMÁS:
+                                    // - Err(_): El motor de C detectó que ocupaba más de 2048 y abortó (Overflow).
+                                    // - Ok(2048): Ocupa lo mismo, no hemos ahorrado nada.
+                                    _ => {
+                                        // Tiramos a la basura el intento y usamos el original
+                                        out_message.data.extend_from_slice(
+                                            &message.data[(i * args.block_size as usize)
+                                                ..((i + 1) * args.block_size as usize)],
+                                        );
+                                        out_message.compressed[i] = false;
+                                        out_message.blocksize[i] = args.block_size as u32;
+                                    }
+                                }
                             }
 
                             // Send the compressed data to the output queue to be processed by the writer.
@@ -368,16 +399,12 @@ fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Result
                 debug!("Reading the {} block with a size of {}", id, to_read);
                 let _ = input_file.read_exact(&mut data);
 
-                // Determine the number of received blocks
-                let blocks_number: usize =
-                    (to_read + (args.block_size as usize - 1)) / args.block_size as usize;
-
                 // Si la cola está llena (100 elementos), send() pausará este hilo automáticamente
                 tx_in
                     .send(MessageBlock {
                         id: id,
-                        compressed: vec![false; blocks_number],
-                        blocksize: vec![args.block_size; blocks_number],
+                        compressed: Vec::new(),
+                        blocksize: Vec::new(),
                         data: data,
                     })
                     .unwrap();
