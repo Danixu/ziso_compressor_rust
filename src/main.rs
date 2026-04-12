@@ -1,5 +1,5 @@
 use clap::Parser;
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, info, trace};
 use lzzzz::{lz4, lz4_hc};
 use std::cmp;
 use std::collections::HashMap;
@@ -215,6 +215,10 @@ fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Result
     };
     debug!("The index shifting will be {} for this iso", pos_shift);
 
+    // Data block alignement variables
+    let alignment = 1usize << pos_shift;
+    debug!("The aligment will be {}", alignment);
+
     // Write the ZSO header
     debug!("Generating the ZSO header");
     let mut header = [0u8; 24];
@@ -269,10 +273,6 @@ fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Result
             .spawn(move || {
                 let mut comp_buffer = vec![0u8; lz4::max_compressed_size(args.block_size as usize)];
                 let lz4_acceleration = lz4::ACC_LEVEL_DEFAULT;
-
-                // Data block alignement variables
-                let alignment = 1usize << pos_shift;
-                let alignment_buffer = vec![0; alignment];
 
                 loop {
                     // If the kill_switch was activated, break the loop
@@ -404,10 +404,13 @@ fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Result
     let reader_thread = thread::Builder::new()
         .name("Reader".to_string())
         .spawn(move || {
-            let file_size = input_file
-                .metadata()
-                .expect("There was an error getting the file info")
-                .len();
+            let Ok(file_metadata) = input_file.metadata() else {
+                error!("There was an error getting the source file information");
+                reader_kill_switch.store(true, Ordering::Relaxed);
+                return;
+            };
+            let file_size = file_metadata.len();
+
             debug!("Total input file size: {} bytes", file_size);
             let mut read_bytes_left = file_size;
             let mut id = 0;
@@ -421,7 +424,6 @@ fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Result
 
                 let to_read: usize = cmp::min(read_bytes_left as usize, queue_real_size);
                 let mut data = vec![0; to_read];
-                let compressed: bool = false;
 
                 debug!("Reading the {} block with a size of {}", id, to_read);
                 let _ = input_file.read_exact(&mut data);
@@ -437,10 +439,17 @@ fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Result
                     .unwrap();
 
                 id += 1;
-                read_bytes_left = file_size
-                    - input_file
-                        .stream_position()
-                        .expect("There was an erorr getting the stream pos");
+                let current_pos = input_file.stream_position();
+                match current_pos {
+                    Ok(position) => read_bytes_left = file_size - position,
+                    Err(value) => {
+                        error!(
+                            "There was an error reading the input file position{:?}",
+                            value
+                        );
+                        reader_kill_switch.store(true, Ordering::Relaxed);
+                    }
+                }
             }
         });
 
@@ -450,7 +459,7 @@ fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Result
     }
 
     // Clone the kill_switch
-    let reader_kill_switch = Arc::clone(&kill_switch);
+    let writer_kill_switch = Arc::clone(&kill_switch);
     // Initialize the writter
     let writer_thread = thread::Builder::new()
         .name("Writer".to_string())
@@ -459,13 +468,10 @@ fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Result
             // Temporal buffer for the block ordering
             let mut out_of_order_buffer: HashMap<usize, MessageBlock> = HashMap::new();
 
-            let mut file =
-                File::create("test.out").expect("There was an error opening the output file");
-
             // The loop works until all the workers tx_out are closed, pausing when there is no data.
             for block in rx_out {
                 // If the kill_switch was activated, break the loop
-                if reader_kill_switch.load(Ordering::Relaxed) {
+                if writer_kill_switch.load(Ordering::Relaxed) {
                     debug!("Kill switch activated. Breaking the loop.");
                     break;
                 }
@@ -474,14 +480,14 @@ fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Result
                 if block.id == expected_id {
                     debug!("Writing the block {} from queue", expected_id);
                     // If the order matches then write it to the file
-                    let _ = file.write_all(&block.data);
+                    let _ = output_file.write_all(&block.data);
                     expected_id += 1;
 
                     // Check if the next blocks are in the ordering buffer
                     while let Some(buffered_data) = out_of_order_buffer.remove(&expected_id) {
                         debug!("Writing the block {} from the buffer", expected_id);
                         // If the next block was waiting in the buffer, then write it into the file
-                        let _ = file.write_all(&buffered_data.data);
+                        let _ = output_file.write_all(&buffered_data.data);
                         expected_id += 1;
                     }
                 } else {
