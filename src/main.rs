@@ -270,6 +270,10 @@ fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Result
                 let mut comp_buffer = vec![0u8; lz4::max_compressed_size(args.block_size as usize)];
                 let lz4_acceleration = lz4::ACC_LEVEL_DEFAULT;
 
+                // Data block alignement variables
+                let alignment = 1usize << pos_shift;
+                let alignment_buffer = vec![0; alignment];
+
                 loop {
                     // If the kill_switch was activated, break the loop
                     if worker_kill_switch.load(Ordering::Relaxed) {
@@ -311,35 +315,58 @@ fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Result
 
                                 // Compress the block
                                 let res = if args.disable_hc {
+                                    trace!("Compressing using LZ4");
                                     lz4::compress(raw_block, &mut comp_buffer, lz4_acceleration)
                                 } else {
+                                    trace!("Compressing using LZ4HC");
                                     lz4_hc::compress(raw_block, &mut comp_buffer, args.level)
                                 };
 
                                 match res {
-                                    // Ok(size) significa que cabía en el buffer.
-                                    // Además, verificamos que realmente ocupe MENOS que el original (2048).
+                                    // Ok(size) the block was compressed sucessfully.
+                                    // And their size is less than the original.
                                     Ok(comp_size) if comp_size < args.block_size as usize => {
-                                        // Hacemos un .to_vec() solo del trozo válido para enviarlo por el canal
+                                        // Extend the message block data with the buffer data
+                                        trace!("Compressed from {} to {} bytes", raw_block.len(), comp_size);
                                         out_message
                                             .data
                                             .extend_from_slice(&comp_buffer[..comp_size]);
+                                        // Setting the block as compressed and storing the final size.
                                         out_message.compressed[i] = true;
                                         out_message.blocksize[i] = comp_size as u32;
                                     }
 
-                                    // El guion bajo (_) captura TODO LO DEMÁS:
-                                    // - Err(_): El motor de C detectó que ocupaba más de 2048 y abortó (Overflow).
-                                    // - Ok(2048): Ocupa lo mismo, no hemos ahorrado nada.
-                                    _ => {
-                                        // Tiramos a la basura el intento y usamos el original
+                                    // - Ok(>raw_block): The size is the same or bigger, and doesn't worth to compress.
+                                    Ok(comp_size) => {
+                                        // Use the original data and set the size to the original one
+                                        trace!("Data was no compressed because the size {:?} is bigger than the original ({})", comp_size, raw_block.len());
                                         out_message.data.extend_from_slice(
                                             &message.data[(i * args.block_size as usize)
                                                 ..((i + 1) * args.block_size as usize)],
                                         );
+                                        // Setting the block as non compressed and storing the real size.
                                         out_message.compressed[i] = false;
                                         out_message.blocksize[i] = args.block_size as u32;
                                     }
+
+                                    Err(reason) => {
+                                        error!("There was an error compressing the block: {:?}", reason);
+                                        worker_kill_switch.store(true, Ordering::Relaxed);
+                                    }
+                                }
+
+                                // Time to fix the data block to ensure that matches the alignment.
+                                // Calculate the alignment using the data size
+                                let padding_needed =
+                                    (alignment - (out_message.blocksize[i] as usize % alignment)) % alignment;
+
+                                // If the data doesn't matches the required position, pad the data with zeroes and correct the size.
+                                if padding_needed > 0 {
+                                    trace!("Padding the block with {} bytes", padding_needed);
+                                    out_message.blocksize[i] += padding_needed as u32;
+                                    out_message
+                                        .data
+                                        .resize(out_message.blocksize[i] as usize, 0);
                                 }
                             }
 
