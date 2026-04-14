@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, error};
 use log::{debug, error, info, trace};
 use lzzzz::{lz4, lz4_hc};
 use std::cmp;
@@ -178,6 +178,15 @@ fn main() {
     ()
 }
 
+fn u32_to_disk_u8(data: &Vec<u32>) -> Vec<u8> {
+    let mut output: Vec<u8> = Vec::new();
+    for value in data {
+        output.extend_from_slice(&value.to_le_bytes());
+    }
+
+    output
+}
+
 fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Result<bool, String> {
     info!("The input file is a image file. Compressing...");
 
@@ -239,7 +248,29 @@ fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Result
     debug!("Reserving the index data space in the output file");
     let _ = output_file
         .seek(SeekFrom::Current(((total_blocks + 1) * 4) as i64))
-        .unwrap();
+        .unwrap_or_else(|e| {
+            error!("Error reserving the output index space: {}", e);
+            std::process::exit(1)
+        });
+
+    // Align the file to the pos_shift
+    debug!("Aligning the file to the nearest indexable position");
+    let output_current_pos = output_file.stream_position().unwrap_or_else(|e| {
+        error!("There was an error getting the output file position: {}", e);
+        std::process::exit(1)
+    });
+    let padding_needed = (alignment - (output_current_pos as usize % alignment)) % alignment;
+
+    // If the file position doesn't matches the required position, pad the data with zeroes and correct the size.
+    if padding_needed > 0 {
+        debug!("Padding the output file with {} bytes", padding_needed);
+        let _ = output_file
+            .seek(SeekFrom::Current(padding_needed as i64))
+            .unwrap_or_else(|e| {
+                error!("Error padding the output index space: {}", e);
+                std::process::exit(1)
+            });
+    }
 
     // A way to stop all the threads if any of them has failed
     let kill_switch = Arc::new(AtomicBool::new(false));
@@ -277,8 +308,8 @@ fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Result
                 loop {
                     // If the kill_switch was activated, break the loop
                     if worker_kill_switch.load(Ordering::Relaxed) {
-                        debug!("Kill switch activated. Breaking the loop.");
-                        break;
+                        debug!("Kill switch activated. Returning...");
+                        return;
                     }
 
                     // Get the lock, pull a block and drop the lock immediately.
@@ -418,8 +449,8 @@ fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Result
             while read_bytes_left > 0 {
                 // If the kill_switch was activated, break the loop
                 if reader_kill_switch.load(Ordering::Relaxed) {
-                    debug!("Kill switch activated. Breaking the loop.");
-                    break;
+                    debug!("Kill switch activated. Returning...");
+                    return;
                 }
 
                 let to_read: usize = cmp::min(read_bytes_left as usize, queue_real_size);
@@ -464,16 +495,25 @@ fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Result
     let writer_thread = thread::Builder::new()
         .name("Writer".to_string())
         .spawn(move || {
+            // Variable to keep the blocks order
             let mut expected_id = 0;
             // Temporal buffer for the block ordering
             let mut out_of_order_buffer: HashMap<usize, MessageBlock> = HashMap::new();
+
+            // Variable to know the current header position
+            let mut index_pos = 0;
+            let Ok(mut outfile_current_pos) = output_file.stream_position() else {
+                error!("There was an error getting the output position");
+                writer_kill_switch.store(true, Ordering::Relaxed);
+                return;
+            };
 
             // The loop works until all the workers tx_out are closed, pausing when there is no data.
             for block in rx_out {
                 // If the kill_switch was activated, break the loop
                 if writer_kill_switch.load(Ordering::Relaxed) {
-                    debug!("Kill switch activated. Breaking the loop.");
-                    break;
+                    debug!("Kill switch activated. Returning...");
+                    return;
                 }
 
                 // Check if the received block is the expected one
@@ -483,12 +523,44 @@ fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Result
                     let _ = output_file.write_all(&block.data);
                     expected_id += 1;
 
+                    // Also write the index table data
+                    for i in 0..block.blocksize.len() {
+                        trace!("Generating the index entry {}", index_pos);
+                        // Set the position in the index
+                        index_table[index_pos] = outfile_current_pos as u32 >> pos_shift;
+                        // Update the curren position with the new one
+                        outfile_current_pos += block.blocksize[i] as u64;
+
+                        // Set the "compressed" bit
+                        if block.compressed[i] {
+                            index_table[index_pos] |= 0x80000000;
+                        }
+
+                        index_pos += 1;
+                    }
+
                     // Check if the next blocks are in the ordering buffer
                     while let Some(buffered_data) = out_of_order_buffer.remove(&expected_id) {
                         debug!("Writing the block {} from the buffer", expected_id);
                         // If the next block was waiting in the buffer, then write it into the file
                         let _ = output_file.write_all(&buffered_data.data);
                         expected_id += 1;
+
+                        // Also write the index table data
+                        for i in 0..buffered_data.blocksize.len() {
+                            trace!("Generating the index entry {}", index_pos);
+                            // Set the position in the index
+                            index_table[index_pos] = outfile_current_pos as u32 >> pos_shift;
+                            // Update the curren position with the new one
+                            outfile_current_pos += buffered_data.blocksize[i] as u64;
+
+                            // Set the "compressed" bit
+                            if buffered_data.compressed[i] {
+                                index_table[index_pos] |= 0x80000000;
+                            }
+
+                            index_pos += 1;
+                        }
                     }
                 } else {
                     debug!(
@@ -499,19 +571,55 @@ fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Result
                     out_of_order_buffer.insert(block.id, block);
                 }
             }
+
+            // Set the last block position as EOF
+            index_table[index_pos] = outfile_current_pos as u32 >> pos_shift;
+
+            // Rewind to the index position
+            let Ok(_) = output_file.seek(SeekFrom::Start(24)) else {
+                error!("There was an error rewinding to the index position.");
+                return;
+            };
+
+            // Write the new index
+            let index_table_u8 = u32_to_disk_u8(&index_table);
+            let _ = output_file.write_all(&index_table_u8);
+            output_file.flush();
         });
 
     if writer_thread.is_err() {
         error!("There was an error creating the writer thread!");
         kill_switch.store(true, Ordering::Relaxed);
+        std::process::exit(1);
     }
 
     // Wait for every thread and then finalize the program
-    reader_thread.unwrap().join().unwrap();
-    for w in workers {
-        w.join().unwrap();
+    match reader_thread.unwrap().join() {
+        Ok(_) => debug!("Waiting for the reader thread."),
+        Err(e) => {
+            error!("There was an error waiting for the reader thread: {:?}", e);
+            kill_switch.store(true, Ordering::Relaxed);
+            std::process::exit(1);
+        }
     }
-    writer_thread.unwrap().join().unwrap();
+    for w in workers {
+        match w.join() {
+            Ok(_) => debug!("Waiting for the worker thread."),
+            Err(e) => {
+                error!("There was an error waiting for the worker thread: {:?}", e);
+                kill_switch.store(true, Ordering::Relaxed);
+                std::process::exit(1);
+            }
+        }
+    }
+    match writer_thread.unwrap().join() {
+        Ok(_) => debug!("Waiting for the writer thread."),
+        Err(e) => {
+            error!("There was an error waiting for the writer thread: {:?}", e);
+            kill_switch.store(true, Ordering::Relaxed);
+            std::process::exit(1);
+        }
+    }
 
     info!("File compressed succesfully!");
 
