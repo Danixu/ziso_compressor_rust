@@ -1,5 +1,5 @@
 // Constants
-pub const QUEUE_SIZE: usize = 16;
+pub const QUEUE_SIZE: usize = 32;
 pub const QUEUE_TRANSFER_SIZE: usize = 2 * 1024 * 1024;
 
 // Message block used to exchange data between threads

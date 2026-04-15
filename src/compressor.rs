@@ -6,19 +6,22 @@ use lzzzz::{lz4, lz4_hc};
 use std::cmp;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
-pub fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Result<bool, String> {
+pub fn compressor(args: Args, input_file: File, output_file: File) -> Result<(), String> {
     info!("The input file is a image file. Compressing...");
 
+    let input_metadata = input_file
+        .metadata()
+        .map_err(|e| format!("Error reading the input file metadata: {}", e))?;
+
+    let mut input_file = BufReader::new(input_file);
+    let mut output_file = BufWriter::new(output_file);
+
     debug!("Gettint input metadata");
-    let input_metadata = input_file.metadata().unwrap_or_else(|e| {
-        error!("Error reading the input file metadata: {}", e);
-        std::process::exit(1)
-    });
 
     // Calculate the number of blocks in the file
     let total_blocks: usize =
@@ -70,30 +73,23 @@ pub fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Re
 
     // Write the empty index to reserve the space
     debug!("Reserving the index data space in the output file");
-    let _ = output_file
+    output_file
         .seek(SeekFrom::Current(((total_blocks + 1) * 4) as i64))
-        .unwrap_or_else(|e| {
-            error!("Error reserving the output index space: {}", e);
-            std::process::exit(1)
-        });
+        .map_err(|e| format!("Error reserving the output index space: {}", e))?;
 
     // Align the file to the pos_shift
     debug!("Aligning the file to the nearest indexable position");
-    let output_current_pos = output_file.stream_position().unwrap_or_else(|e| {
-        error!("There was an error getting the output file position: {}", e);
-        std::process::exit(1)
-    });
+    let output_current_pos = output_file
+        .stream_position()
+        .map_err(|e| format!("There was an error getting the output file position: {}", e))?;
     let padding_needed = (alignment - (output_current_pos as usize % alignment)) % alignment;
 
     // If the file position doesn't matches the required position, pad the data with zeroes and correct the size.
     if padding_needed > 0 {
         debug!("Padding the output file with {} bytes", padding_needed);
-        let _ = output_file
+        output_file
             .seek(SeekFrom::Current(padding_needed as i64))
-            .unwrap_or_else(|e| {
-                error!("Error padding the output index space: {}", e);
-                std::process::exit(1)
-            });
+            .map_err(|e| format!("Error padding the output index space: {}", e))?;
     }
 
     // A way to stop all the threads if any of them has failed
@@ -256,7 +252,7 @@ pub fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Re
     let reader_thread = thread::Builder::new()
         .name("Reader".to_string())
         .spawn(move || {
-            let Ok(file_metadata) = input_file.metadata() else {
+            let Ok(file_metadata) = input_file.get_ref().metadata() else {
                 error!("There was an error getting the source file information");
                 reader_kill_switch.store(true, Ordering::Relaxed);
                 return;
@@ -280,7 +276,7 @@ pub fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Re
                 debug!("Reading the {} block with a size of {}", id, to_read);
                 let _ = input_file.read_exact(&mut data);
 
-                // Si la cola está llena (100 elementos), send() pausará este hilo automáticamente
+                // Send to the input channel
                 tx_in
                     .send(MessageBlock {
                         id: id,
@@ -411,38 +407,35 @@ pub fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Re
     if writer_thread.is_err() {
         error!("There was an error creating the writer thread!");
         kill_switch.store(true, Ordering::Relaxed);
-        std::process::exit(1);
+        return Err("Error creating writer thread".to_string());
     }
 
     // Wait for every thread and then finalize the program
     match reader_thread.unwrap().join() {
         Ok(_) => debug!("Waiting for the reader thread."),
         Err(e) => {
-            error!("There was an error waiting for the reader thread: {:?}", e);
             kill_switch.store(true, Ordering::Relaxed);
-            std::process::exit(1);
+            return Err(format!("Error waiting for reader thread: {:?}", e));
         }
     }
     for w in workers {
         match w.join() {
             Ok(_) => debug!("Waiting for the worker thread."),
             Err(e) => {
-                error!("There was an error waiting for the worker thread: {:?}", e);
                 kill_switch.store(true, Ordering::Relaxed);
-                std::process::exit(1);
+                return Err(format!("Error waiting for worker thread: {:?}", e));
             }
         }
     }
     match writer_thread.unwrap().join() {
         Ok(_) => debug!("Waiting for the writer thread."),
         Err(e) => {
-            error!("There was an error waiting for the writer thread: {:?}", e);
             kill_switch.store(true, Ordering::Relaxed);
-            std::process::exit(1);
+            return Err(format!("Error waiting for writer thread: {:?}", e));
         }
     }
 
     info!("File compressed succesfully!");
 
-    Ok(true)
+    Ok(())
 }

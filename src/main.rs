@@ -121,9 +121,15 @@ fn main() {
             std::process::exit(1)
         });
     if compressed {
-        let _ = decompressor(args, input_file, output_file);
+        if let Err(e) = decompressor(args, input_file, output_file) {
+            error!("Decompression failed: {}", e);
+            std::process::exit(1);
+        }
     } else {
-        let _ = compressor(args, input_file, output_file);
+        if let Err(e) = compressor(args, input_file, output_file) {
+            error!("Compression failed: {}", e);
+            std::process::exit(1);
+        }
     }
     ()
 }
