@@ -1,4 +1,4 @@
-use clap::{Parser, error};
+use clap::Parser;
 use log::{debug, error, info, trace};
 use lzzzz::{lz4, lz4_hc};
 use std::cmp;
@@ -356,7 +356,7 @@ fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Result
                                 match res {
                                     // Ok(size) the block was compressed sucessfully.
                                     // And their size is less than the original.
-                                    Ok(comp_size) if comp_size < args.block_size as usize => {
+                                    Ok(comp_size) if comp_size < raw_block.len() => {
                                         // Extend the message block data with the buffer data
                                         trace!("Compressed from {} to {} bytes", raw_block.len(), comp_size);
                                         out_message
@@ -370,14 +370,11 @@ fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Result
                                     // - Ok(>raw_block): The size is the same or bigger, and doesn't worth to compress.
                                     Ok(comp_size) => {
                                         // Use the original data and set the size to the original one
-                                        trace!("Data was no compressed because the size {:?} is bigger than the original ({})", comp_size, raw_block.len());
-                                        out_message.data.extend_from_slice(
-                                            &message.data[(i * args.block_size as usize)
-                                                ..((i + 1) * args.block_size as usize)],
-                                        );
+                                        trace!("Data was no compressed because the size {} is bigger than the original ({})", comp_size, raw_block.len());
+                                        out_message.data.extend_from_slice(raw_block);
                                         // Setting the block as non compressed and storing the real size.
                                         out_message.compressed[i] = false;
-                                        out_message.blocksize[i] = args.block_size as u32;
+                                        out_message.blocksize[i] = raw_block.len() as u32;
                                     }
 
                                     Err(reason) => {
@@ -532,7 +529,7 @@ fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Result
                         outfile_current_pos += block.blocksize[i] as u64;
 
                         // Set the "compressed" bit
-                        if block.compressed[i] {
+                        if !block.compressed[i] {
                             index_table[index_pos] |= 0x80000000;
                         }
 
@@ -555,7 +552,7 @@ fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Result
                             outfile_current_pos += buffered_data.blocksize[i] as u64;
 
                             // Set the "compressed" bit
-                            if buffered_data.compressed[i] {
+                            if !buffered_data.compressed[i] {
                                 index_table[index_pos] |= 0x80000000;
                             }
 
@@ -584,7 +581,7 @@ fn compressor(args: Args, mut input_file: File, mut output_file: File) -> Result
             // Write the new index
             let index_table_u8 = u32_to_disk_u8(&index_table);
             let _ = output_file.write_all(&index_table_u8);
-            output_file.flush();
+            let _ = output_file.flush();
         });
 
     if writer_thread.is_err() {
