@@ -5,3 +5,9 @@ pub fn u32_to_disk_u8(data: &Vec<u32>) -> Vec<u8> {
     }
     output
 }
+
+pub fn u8_from_disk_to_u32(data: &[u8]) -> Vec<u32> {
+    data.chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
+}

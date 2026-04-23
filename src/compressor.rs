@@ -55,7 +55,7 @@ pub fn compressor(args: Args, input_file: File, output_file: File) -> Result<(),
     let alignment = 1usize << pos_shift;
     debug!("The aligment will be {}", alignment);
 
-    // Write the ZSO header
+    // Generate the ZSO header
     debug!("Generating the ZSO header");
     let mut header = [0u8; 24];
     header[0..4].copy_from_slice(b"ZISO"); // Magic string
