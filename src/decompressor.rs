@@ -7,10 +7,17 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
+use std::thread::{self, current};
 
 pub fn decompressor(args: Args, mut input_file: File, mut output_file: File) -> Result<(), String> {
     info!("The input file is a ZSO file. Decompressing...");
+
+    let input_metadata = input_file
+        .metadata()
+        .map_err(|e| format!("Error reading the input file metadata: {}", e))?;
+
+    let mut input_file = BufReader::new(input_file);
+    let mut output_file = BufWriter::new(output_file);
 
     // Getting the header
     debug!("Reading the ZSO header");
@@ -59,11 +66,8 @@ pub fn decompressor(args: Args, mut input_file: File, mut output_file: File) -> 
         "Current position after reading the index table: {}",
         current_pos
     );
-    let real_file_size = input_file
-        .metadata()
-        .map_err(|e| format!("Cannot get input file metadata: {}", e))?
-        .len();
-    debug!("Real file size: {}", real_file_size);
+    let real_file_size = input_metadata.len();
+    debug!("Real input file size: {}", real_file_size);
 
     // Calculate the padding to ensure that the compressed data starts at the correct alignment
     let padding_needed = (pos_shift - (current_pos % pos_shift as u64) as u8) % pos_shift;
@@ -132,6 +136,62 @@ pub fn decompressor(args: Args, mut input_file: File, mut output_file: File) -> 
         .name("Reader".to_string())
         .spawn(move || {
             // Reader thread
+            let mut current_block: usize = 0;
+            let mut id = 0;
+
+            while current_block < index_table_size {
+                // If the kill_switch was activated, break the loop
+                if reader_kill_switch.load(Ordering::Relaxed) {
+                    debug!("Kill switch activated. Returning...");
+                    return;
+                }
+
+                let readable_blocks = {
+                    if (index_table_size - current_block) < queue_max_blocks {
+                        index_table_size - current_block
+                    } else {
+                        queue_max_blocks
+                    }
+                };
+
+                // Read the max number of blocks that fits the buffers
+                let first_position = (index_table[current_block] << pos_shift) as usize;
+                let last_position =
+                    (index_table[current_block + readable_blocks + 1] << pos_shift) as usize;
+
+                // Data to read
+                let to_read = last_position - first_position;
+                let mut data = vec![0; to_read];
+                let mut cb_compressed: Vec<bool> = vec![false; readable_blocks];
+                let mut cb_blocksize: Vec<u32> = vec![0; readable_blocks];
+
+                debug!("Reading {} blocks with a size of {}", id, to_read);
+                let _ = input_file.read_exact(&mut data);
+
+                debug!("Setting the block info (compression and blocksize)");
+                for i in 0..readable_blocks {
+                    // Set the compressed state
+                    cb_compressed[i] = (index_table[current_block + i] & 0x80000000) == 0;
+
+                    // Calculate the block size
+                    let start_offset_raw = index_table[current_block + i] & 0x7FFFFFFF;
+                    let end_offset_raw = index_table[current_block + i + 1] & 0x7FFFFFFF;
+                    cb_blocksize[i] = end_offset_raw - start_offset_raw;
+                }
+
+                // Send to the input channel
+                tx_in
+                    .send(MessageBlock {
+                        id: id,
+                        compressed: cb_compressed,
+                        blocksize: cb_blocksize,
+                        data: data,
+                    })
+                    .unwrap();
+
+                id += 1;
+                current_block += readable_blocks;
+            }
         });
 
     if reader_thread.is_err() {

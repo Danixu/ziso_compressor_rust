@@ -21,7 +21,7 @@ pub fn compressor(args: Args, input_file: File, output_file: File) -> Result<(),
     let mut input_file = BufReader::new(input_file);
     let mut output_file = BufWriter::new(output_file);
 
-    debug!("Gettint input metadata");
+    debug!("Getting input metadata");
 
     // Calculate the number of blocks in the file
     let total_blocks: usize =
