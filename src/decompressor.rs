@@ -133,105 +133,72 @@ pub fn decompressor(args: Args, input_file: File, output_file: File) -> Result<(
                         return;
                     }
 
-                    // Get the lock, pull a block and drop the lock immediately.
+                    // Pull a block from the shared receiver.
                     debug!("Getting a new rx message");
-                    let message_opt = {
+                    let message = {
                         trace!("Getting the rx lock");
                         let lock = rx.lock().unwrap();
                         trace!("Pulling the rx queue message");
-                        // Use recv_timeout to allow checking kill_switch periodically
-                        lock.recv_timeout(Duration::from_millis(100)).ok()
+                        match lock.recv_timeout(Duration::from_millis(100)) {
+                            Ok(message) => message,
+                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
                     };
 
-                    match message_opt {
-                        Some(message) => {
-                            debug!("Received a message. Processing...");
+                    debug!("Received a message. Processing...");
+                    let blocks_number: usize = message.compressed.len();
+                    debug!("Processing {} blocks", blocks_number);
+                    let mut out_message = MessageBlock {
+                        id: message.id,
+                        compressed: Vec::new(),
+                        blocksize: Vec::new(),
+                        data: Vec::new(),
+                    };
+                    let mut current_data_offset: usize = 0;
 
-                            // Determine the number of received blocks
-                            let blocks_number: usize = message.compressed.len();
+                    for i in 0..blocks_number {
+                        trace!(
+                            "Working on block {} with offset {} and size {}",
+                            i, current_data_offset, message.blocksize[i]
+                        );
 
-                            // Processing the data block by block
-                            debug!("Processing {} blocks", blocks_number);
-                            let mut out_message = MessageBlock {
-                                id: message.id,
-                                compressed: Vec::new(),
-                                blocksize: Vec::new(),
-                                data: Vec::new(),
-                            };
-                            let mut current_data_offset: usize = 0;
-                            let mut error_occurred = false;
+                        let comp_data: &[u8] = &message.data[current_data_offset
+                            ..current_data_offset + message.blocksize[i] as usize];
 
-                            for i in 0..blocks_number {
-                                trace!(
-                                    "Working on block {} with offset {} and size {}",
-                                    i, current_data_offset, message.blocksize[i]
-                                );
-                                // Reference the block
-                                let comp_data: &[u8] = &message.data[current_data_offset
-                                    ..current_data_offset + message.blocksize[i] as usize];
-
-                                // Decompress the block if required
-                                if message.compressed[i] {
-                                    trace!("Decompressing using LZ4");
-                                    let res = lz4::decompress(comp_data, &mut decomp_buffer);
-
-                                    match res {
-                                        // Ok(size) the block was compressed sucessfully.
-                                        // And their size is less than the original.
-                                        Ok(decomp_size) => {
-                                            // Extend the message block data with the buffer data
-                                            trace!(
-                                                "The block was decompressed successfully with a size of {}.", decomp_size
-                                            );
-                                            out_message.data.extend_from_slice(&decomp_buffer[..decomp_size]);
-                                        }
-
-                                        Err(reason) => {
-                                            error!(
-                                                "There was an error decompressing the block: {:?}",
-                                                reason
-                                            );
-
-                                            worker_kill_switch.store(true, Ordering::Release);
-                                            error_occurred = true;
-                                            break;
-                                        }
-                                    };
-                                } else {
-                                    trace!("Copying the uncompressed data");
-                                    out_message.data.extend_from_slice(comp_data);
+                        if message.compressed[i] {
+                            trace!("Decompressing using LZ4");
+                            match lz4::decompress(comp_data, &mut decomp_buffer) {
+                                Ok(decomp_size) => {
+                                    trace!(
+                                        "The block was decompressed successfully with a size of {}.",
+                                        decomp_size
+                                    );
+                                    out_message.data.extend_from_slice(&decomp_buffer[..decomp_size]);
                                 }
-
-                                current_data_offset += message.blocksize[i] as usize;
-                            }
-
-                            // Only send if no error occurred
-                            if !error_occurred {
-                                // Send the decompressed data to the output queue to be processed by the writer.
-                                match tx.send(out_message) {
-                                    Ok(_) => {},
-                                    Err(_) => {
-                                        error!("Writer channel disconnected. Aborting decompression");
-                                        worker_kill_switch.store(true, Ordering::Release);
-                                        return;
-                                    }
+                                Err(reason) => {
+                                    error!(
+                                        "There was an error decompressing the block: {:?}",
+                                        reason
+                                    );
+                                    worker_kill_switch.store(true, Ordering::Release);
+                                    return;
                                 }
-                            } else {
-                                return;
                             }
+                        } else {
+                            trace!("Copying the uncompressed data");
+                            out_message.data.extend_from_slice(comp_data);
                         }
-                        None => {
-                            // Timeout occurred, check if kill_switch is active or channel is closed
-                            if worker_kill_switch.load(Ordering::Relaxed) {
-                                debug!("Kill switch activated during timeout. Returning...");
-                                return;
-                            }
-                            // Try once more to check if channel is closed
-                            let lock = rx.lock().unwrap();
-                            if lock.try_recv().is_err() {
-                                // Channel is closed or no data
-                                break;
-                            }
+
+                        current_data_offset += message.blocksize[i] as usize;
+                    }
+
+                    match tx.send(out_message) {
+                        Ok(_) => {}
+                        Err(_) => {
+                            error!("Writer channel disconnected. Aborting decompression");
+                            worker_kill_switch.store(true, Ordering::Release);
+                            return;
                         }
                     }
                 }
