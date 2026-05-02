@@ -9,6 +9,7 @@ use std::io::{BufReader, BufWriter, Read, Seek, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self};
+use std::time::Duration;
 
 pub fn decompressor(args: Args, input_file: File, output_file: File) -> Result<(), String> {
     info!("The input file is a ZSO file. Decompressing...");
@@ -138,7 +139,8 @@ pub fn decompressor(args: Args, input_file: File, output_file: File) -> Result<(
                         trace!("Getting the rx lock");
                         let lock = rx.lock().unwrap();
                         trace!("Pulling the rx queue message");
-                        lock.recv().ok() // ok() returns None if the queue was closed (EOF).
+                        // Use recv_timeout to allow checking kill_switch periodically
+                        lock.recv_timeout(Duration::from_millis(100)).ok()
                     };
 
                     match message_opt {
@@ -157,6 +159,8 @@ pub fn decompressor(args: Args, input_file: File, output_file: File) -> Result<(
                                 data: Vec::new(),
                             };
                             let mut current_data_offset: usize = 0;
+                            let mut error_occurred = false;
+
                             for i in 0..blocks_number {
                                 trace!(
                                     "Working on block {} with offset {} and size {}",
@@ -169,7 +173,7 @@ pub fn decompressor(args: Args, input_file: File, output_file: File) -> Result<(
                                 // Decompress the block if required
                                 if message.compressed[i] {
                                     trace!("Decompressing using LZ4");
-                                    let res =lz4::decompress(comp_data, &mut decomp_buffer);
+                                    let res = lz4::decompress(comp_data, &mut decomp_buffer);
 
                                     match res {
                                         // Ok(size) the block was compressed sucessfully.
@@ -179,7 +183,7 @@ pub fn decompressor(args: Args, input_file: File, output_file: File) -> Result<(
                                             trace!(
                                                 "The block was decompressed successfully with a size of {}.", decomp_size
                                             );
-                                            out_message.data.extend_from_slice(&decomp_buffer);
+                                            out_message.data.extend_from_slice(&decomp_buffer[..decomp_size]);
                                         }
 
                                         Err(reason) => {
@@ -188,8 +192,9 @@ pub fn decompressor(args: Args, input_file: File, output_file: File) -> Result<(
                                                 reason
                                             );
 
-                                            worker_kill_switch.store(true, Ordering::Relaxed);
-                                            return;
+                                            worker_kill_switch.store(true, Ordering::Release);
+                                            error_occurred = true;
+                                            break;
                                         }
                                     };
                                 } else {
@@ -200,20 +205,33 @@ pub fn decompressor(args: Args, input_file: File, output_file: File) -> Result<(
                                 current_data_offset += message.blocksize[i] as usize;
                             }
 
-                            // Send the compressed data to the output queue to be processed by the writer.
-                            let sent = tx.send(out_message);
-                            if sent.is_err() {
-                                error!(
-                                    "There was an error sending the processed data to the writer"
-                                );
-                                worker_kill_switch.store(true, Ordering::Relaxed);
+                            // Only send if no error occurred
+                            if !error_occurred {
+                                // Send the decompressed data to the output queue to be processed by the writer.
+                                match tx.send(out_message) {
+                                    Ok(_) => {},
+                                    Err(_) => {
+                                        error!("Writer channel disconnected. Aborting decompression");
+                                        worker_kill_switch.store(true, Ordering::Release);
+                                        return;
+                                    }
+                                }
+                            } else {
+                                return;
                             }
                         }
                         None => {
-                            debug!(
-                                "There are no more messages in the queue. Closing the thread..."
-                            );
-                            break; // The reading channel was closed so the worker stops
+                            // Timeout occurred, check if kill_switch is active or channel is closed
+                            if worker_kill_switch.load(Ordering::Relaxed) {
+                                debug!("Kill switch activated during timeout. Returning...");
+                                return;
+                            }
+                            // Try once more to check if channel is closed
+                            let lock = rx.lock().unwrap();
+                            if lock.try_recv().is_err() {
+                                // Channel is closed or no data
+                                break;
+                            }
                         }
                     }
                 }
@@ -279,7 +297,11 @@ pub fn decompressor(args: Args, input_file: File, output_file: File) -> Result<(
                 let mut cb_blocksize: Vec<u32> = vec![0; readable_blocks];
 
                 debug!("Reading the block ID {} with a size of {}", id, to_read);
-                let _ = input_file.read_exact(&mut data);
+                if let Err(e) = input_file.read_exact(&mut data) {
+                    error!("Error reading data from input file: {}", e);
+                    reader_kill_switch.store(true, Ordering::Relaxed);
+                    return;
+                }
 
                 debug!("Setting the block info (compression and blocksize)");
                 for i in 0..readable_blocks {
@@ -292,19 +314,24 @@ pub fn decompressor(args: Args, input_file: File, output_file: File) -> Result<(
                     cb_blocksize[i] = end_offset_raw - start_offset_raw;
                 }
 
-                // Send to the input channel
+                // Send to the input channel with better error handling
                 debug!("Sending the block ID {} to the workers", id);
-                tx_in
-                    .send(MessageBlock {
-                        id: id,
-                        compressed: cb_compressed,
-                        blocksize: cb_blocksize,
-                        data: data,
-                    })
-                    .unwrap();
-
-                id += 1;
-                current_block += readable_blocks;
+                match tx_in.send(MessageBlock {
+                    id: id,
+                    compressed: cb_compressed,
+                    blocksize: cb_blocksize,
+                    data: data,
+                }) {
+                    Ok(_) => {
+                        id += 1;
+                        current_block += readable_blocks;
+                    }
+                    Err(_) => {
+                        error!("Workers channel disconnected. Workers may have panicked.");
+                        reader_kill_switch.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                }
             }
         });
 
@@ -325,47 +352,74 @@ pub fn decompressor(args: Args, input_file: File, output_file: File) -> Result<(
             let mut out_of_order_buffer: HashMap<usize, MessageBlock> = HashMap::new();
 
             // The loop works until all the workers tx_out are closed, pausing when there is no data.
-            for block in rx_out {
+            loop {
                 // If the kill_switch was activated, break the loop
                 if writer_kill_switch.load(Ordering::Relaxed) {
                     debug!("Kill switch activated. Returning...");
-                    return;
+                    break;
                 }
 
-                // Check if the received block is the expected one
-                if block.id == expected_id {
-                    debug!(
-                        "Writing {} bytes from the block {} from queue",
-                        block.data.len(),
-                        expected_id
-                    );
-                    // If the order matches then write it to the file
-                    let _ = output_file.write_all(&block.data);
-                    expected_id += 1;
+                match rx_out.recv_timeout(Duration::from_millis(500)) {
+                    Ok(block) => {
+                        // Check if the received block is the expected one
+                        if block.id == expected_id {
+                            debug!(
+                                "Writing {} bytes from the block {} from queue",
+                                block.data.len(),
+                                expected_id
+                            );
+                            // If the order matches then write it to the file
+                            if let Err(e) = output_file.write_all(&block.data) {
+                                error!("Error writing block {} to output file: {}", expected_id, e);
+                                writer_kill_switch.store(true, Ordering::Release);
+                                break;
+                            }
+                            expected_id += 1;
 
-                    // Check if the next blocks are in the ordering buffer
-                    while let Some(buffered_data) = out_of_order_buffer.remove(&expected_id) {
-                        debug!(
-                            "Writing {} bytes from the block {} from the buffer",
-                            buffered_data.data.len(),
-                            expected_id
-                        );
-                        // If the next block was waiting in the buffer, then write it into the file
-                        let _ = output_file.write_all(&buffered_data.data);
-                        expected_id += 1;
+                            // Check if the next blocks are in the ordering buffer
+                            while let Some(buffered_data) = out_of_order_buffer.remove(&expected_id)
+                            {
+                                debug!(
+                                    "Writing {} bytes from the block {} from the buffer",
+                                    buffered_data.data.len(),
+                                    expected_id
+                                );
+                                // If the next block was waiting in the buffer, then write it into the file
+                                if let Err(e) = output_file.write_all(&buffered_data.data) {
+                                    error!(
+                                        "Error writing buffered block {} to output file: {}",
+                                        expected_id, e
+                                    );
+                                    writer_kill_switch.store(true, Ordering::Release);
+                                    return;
+                                }
+                                expected_id += 1;
+                            }
+                        } else {
+                            debug!(
+                                "The received block ({}) was not expected right now (expected: {})",
+                                block.id, expected_id
+                            );
+                            // If the block doesn't matches the expected block then store it in the ordering buffer.
+                            out_of_order_buffer.insert(block.id, block);
+                        }
                     }
-                } else {
-                    debug!(
-                        "The received block ({}) was not expected right now (expected: {})",
-                        block.id, expected_id
-                    );
-                    // If the block doesn't matches the expected block then store it in the ordering buffer.
-                    out_of_order_buffer.insert(block.id, block);
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        // Timeout occurred, loop will check kill_switch again
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        // All workers have finished, channel is closed
+                        debug!("Output channel closed. All workers finished processing.");
+                        break;
+                    }
                 }
             }
 
             // Flush the output file to ensure all data is written to disk
-            let _ = output_file.flush();
+            if let Err(e) = output_file.flush() {
+                error!("Error flushing output file: {}", e);
+            }
         });
 
     if writer_thread.is_err() {
@@ -375,27 +429,36 @@ pub fn decompressor(args: Args, input_file: File, output_file: File) -> Result<(
     }
 
     // Wait for every thread and then finalize the program
-    match reader_thread.unwrap().join() {
-        Ok(_) => debug!("Waiting for the reader thread."),
-        Err(e) => {
-            kill_switch.store(true, Ordering::Relaxed);
-            return Err(format!("Error waiting for reader thread: {:?}", e));
-        }
+    // Wait for the reader thread to finish
+    let reader_result = reader_thread
+        .unwrap()
+        .join()
+        .map_err(|_| "Reader thread panicked".to_string());
+
+    if reader_result.is_err() {
+        kill_switch.store(true, Ordering::Release);
+        return reader_result.map(|_| ());
     }
-    for w in workers {
+
+    debug!("Reader thread finished successfully");
+
+    // Wait for all worker threads to finish
+    for (idx, w) in workers.into_iter().enumerate() {
         match w.join() {
-            Ok(_) => debug!("Waiting for the worker thread."),
-            Err(e) => {
-                kill_switch.store(true, Ordering::Relaxed);
-                return Err(format!("Error waiting for worker thread: {:?}", e));
+            Ok(_) => debug!("Worker thread {} finished successfully", idx),
+            Err(_) => {
+                kill_switch.store(true, Ordering::Release);
+                return Err(format!("Worker thread {} panicked", idx));
             }
         }
     }
+
+    // Wait for the writer thread to finish
     match writer_thread.unwrap().join() {
-        Ok(_) => debug!("Waiting for the writer thread."),
-        Err(e) => {
-            kill_switch.store(true, Ordering::Relaxed);
-            return Err(format!("Error waiting for writer thread: {:?}", e));
+        Ok(_) => debug!("Writer thread finished successfully"),
+        Err(_) => {
+            kill_switch.store(true, Ordering::Release);
+            return Err("Writer thread panicked".to_string());
         }
     }
 
