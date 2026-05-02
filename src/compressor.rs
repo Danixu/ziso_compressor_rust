@@ -1,6 +1,6 @@
 use super::args::Args;
 use super::types::{MessageBlock, QUEUE_SIZE, QUEUE_TRANSFER_SIZE};
-use super::utils::u32_to_disk_u8;
+use super::utils::{padding_calculator, u32_to_disk_u8};
 use log::{debug, error, info, trace};
 use lzzzz::{lz4, lz4_hc};
 use std::cmp;
@@ -82,14 +82,16 @@ pub fn compressor(args: Args, input_file: File, output_file: File) -> Result<(),
     let output_current_pos = output_file
         .stream_position()
         .map_err(|e| format!("There was an error getting the output file position: {}", e))?;
-    let padding_needed = (alignment - (output_current_pos as usize % alignment)) % alignment;
 
-    // If the file position doesn't matches the required position, pad the data with zeroes and correct the size.
-    if padding_needed > 0 {
-        debug!("Padding the output file with {} bytes", padding_needed);
+    let padded_pos = padding_calculator(pos_shift, output_current_pos);
+    if padded_pos != output_current_pos {
+        debug!(
+            "Padding the output file with {} bytes",
+            padded_pos - output_current_pos
+        );
         output_file
-            .seek(SeekFrom::Current(padding_needed as i64))
-            .map_err(|e| format!("Error padding the output index space: {}", e))?;
+            .seek(SeekFrom::Start(padded_pos))
+            .map_err(|e| format!("Error aligning the output file: {}", e))?;
     }
 
     // A way to stop all the threads if any of them has failed

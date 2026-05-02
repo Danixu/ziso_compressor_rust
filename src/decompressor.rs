@@ -1,15 +1,16 @@
 use super::args::Args;
 use super::types::{MessageBlock, QUEUE_SIZE, QUEUE_TRANSFER_SIZE};
-use super::utils::u8_from_disk_to_u32;
+use super::utils::{padding_calculator, u8_from_disk_to_u32};
 use log::{debug, error, info, trace};
+use lzzzz::lz4;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::thread::{self, current};
+use std::thread::{self};
 
-pub fn decompressor(args: Args, mut input_file: File, mut output_file: File) -> Result<(), String> {
+pub fn decompressor(args: Args, input_file: File, output_file: File) -> Result<(), String> {
     info!("The input file is a ZSO file. Decompressing...");
 
     let input_metadata = input_file
@@ -45,14 +46,13 @@ pub fn decompressor(args: Args, mut input_file: File, mut output_file: File) -> 
 
     // Read the index table
     debug!("Reading the index table");
-    let index_table_size = ((blocks_count + 1) * 4) as usize;
-    let mut index_table_bytes = vec![0u8; index_table_size];
+    let index_table_raw_size = ((blocks_count + 1) * 4) as usize;
+    let mut index_table_bytes = vec![0u8; index_table_raw_size];
     input_file
         .read_exact(&mut index_table_bytes)
         .map_err(|e| format!("Cannot read the index table: {}", e))?;
 
     let index_table: Vec<u32> = u8_from_disk_to_u32(&index_table_bytes);
-    trace!("Index table: {:?}", &index_table);
     if index_table.is_empty() {
         return Err("Index table is empty".to_string());
     }
@@ -70,10 +70,13 @@ pub fn decompressor(args: Args, mut input_file: File, mut output_file: File) -> 
     debug!("Real input file size: {}", real_file_size);
 
     // Calculate the padding to ensure that the compressed data starts at the correct alignment
-    let padding_needed = (pos_shift - (current_pos % pos_shift as u64) as u8) % pos_shift;
-    if padding_needed > 0 {
-        current_pos += padding_needed as u64;
-    }
+    current_pos = padding_calculator(pos_shift, current_pos);
+
+    debug!("First entry of the index table: {}", index_table[0]);
+    debug!(
+        "Last entry of the index table: {}",
+        index_table[index_table.len() - 1]
+    );
 
     if index_table[0] != (current_pos >> pos_shift) as u32 {
         return Err(format!(
@@ -118,6 +121,102 @@ pub fn decompressor(args: Args, mut input_file: File, mut output_file: File) -> 
             .name(format!("Worker-{}", i))
             .spawn(move || {
                 // Thread worker
+                debug!("Worker thread started");
+                debug!("Creating the decompression buffer with a size of {}", block_size);
+                let mut decomp_buffer = vec![0u8; block_size as usize];
+
+                loop {
+                    // If the kill_switch was activated, break the loop
+                    if worker_kill_switch.load(Ordering::Relaxed) {
+                        debug!("Kill switch activated. Returning...");
+                        return;
+                    }
+
+                    // Get the lock, pull a block and drop the lock immediately.
+                    debug!("Getting a new rx message");
+                    let message_opt = {
+                        trace!("Getting the rx lock");
+                        let lock = rx.lock().unwrap();
+                        trace!("Pulling the rx queue message");
+                        lock.recv().ok() // ok() returns None if the queue was closed (EOF).
+                    };
+
+                    match message_opt {
+                        Some(message) => {
+                            debug!("Received a message. Processing...");
+
+                            // Determine the number of received blocks
+                            let blocks_number: usize = message.compressed.len();
+
+                            // Processing the data block by block
+                            debug!("Processing {} blocks", blocks_number);
+                            let mut out_message = MessageBlock {
+                                id: message.id,
+                                compressed: Vec::new(),
+                                blocksize: Vec::new(),
+                                data: Vec::new(),
+                            };
+                            let mut current_data_offset: usize = 0;
+                            for i in 0..blocks_number {
+                                trace!(
+                                    "Working on block {} with offset {} and size {}",
+                                    i, current_data_offset, message.blocksize[i]
+                                );
+                                // Reference the block
+                                let comp_data: &[u8] = &message.data[current_data_offset
+                                    ..current_data_offset + message.blocksize[i] as usize];
+
+                                // Decompress the block if required
+                                if message.compressed[i] {
+                                    trace!("Decompressing using LZ4");
+                                    let res =lz4::decompress(comp_data, &mut decomp_buffer);
+
+                                    match res {
+                                        // Ok(size) the block was compressed sucessfully.
+                                        // And their size is less than the original.
+                                        Ok(decomp_size) => {
+                                            // Extend the message block data with the buffer data
+                                            trace!(
+                                                "The block was decompressed successfully with a size of {}.", decomp_size
+                                            );
+                                            out_message.data.extend_from_slice(&decomp_buffer);
+                                        }
+
+                                        Err(reason) => {
+                                            error!(
+                                                "There was an error decompressing the block: {:?}",
+                                                reason
+                                            );
+
+                                            worker_kill_switch.store(true, Ordering::Relaxed);
+                                            return;
+                                        }
+                                    };
+                                } else {
+                                    trace!("Copying the uncompressed data");
+                                    out_message.data.extend_from_slice(comp_data);
+                                }
+
+                                current_data_offset += message.blocksize[i] as usize;
+                            }
+
+                            // Send the compressed data to the output queue to be processed by the writer.
+                            let sent = tx.send(out_message);
+                            if sent.is_err() {
+                                error!(
+                                    "There was an error sending the processed data to the writer"
+                                );
+                                worker_kill_switch.store(true, Ordering::Relaxed);
+                            }
+                        }
+                        None => {
+                            debug!(
+                                "There are no more messages in the queue. Closing the thread..."
+                            );
+                            break; // The reading channel was closed so the worker stops
+                        }
+                    }
+                }
             });
         if worker.is_err() {
             error!("There was an error creating the workers threads!");
@@ -138,8 +237,11 @@ pub fn decompressor(args: Args, mut input_file: File, mut output_file: File) -> 
             // Reader thread
             let mut current_block: usize = 0;
             let mut id = 0;
+            // The number of blocks is equal to the index table entries minus 1
+            // (the last one is the end of the last block, not a real block).
+            let index_entries = index_table.len() - 1;
 
-            while current_block < index_table_size {
+            while current_block < index_entries as usize {
                 // If the kill_switch was activated, break the loop
                 if reader_kill_switch.load(Ordering::Relaxed) {
                     debug!("Kill switch activated. Returning...");
@@ -147,25 +249,36 @@ pub fn decompressor(args: Args, mut input_file: File, mut output_file: File) -> 
                 }
 
                 let readable_blocks = {
-                    if (index_table_size - current_block) < queue_max_blocks {
-                        index_table_size - current_block
+                    if (index_entries as usize - current_block) < queue_max_blocks {
+                        index_entries as usize - current_block
                     } else {
                         queue_max_blocks
                     }
                 };
+                debug!("Number of blocks that can be readed: {}", readable_blocks);
 
                 // Read the max number of blocks that fits the buffers
-                let first_position = (index_table[current_block] << pos_shift) as usize;
-                let last_position =
-                    (index_table[current_block + readable_blocks + 1] << pos_shift) as usize;
+                debug!(
+                    "Reading the blocks {} to {}",
+                    current_block,
+                    current_block + readable_blocks
+                );
+                let starting_position =
+                    (index_table[current_block] << pos_shift) as usize & 0x7FFFFFFF;
+                let ending_position = (index_table[current_block + readable_blocks] << pos_shift)
+                    as usize
+                    & 0x7FFFFFFF;
+
+                debug!("Starting position: {}", starting_position);
+                debug!("Ending position: {}", ending_position);
 
                 // Data to read
-                let to_read = last_position - first_position;
+                let to_read = ending_position - starting_position;
                 let mut data = vec![0; to_read];
                 let mut cb_compressed: Vec<bool> = vec![false; readable_blocks];
                 let mut cb_blocksize: Vec<u32> = vec![0; readable_blocks];
 
-                debug!("Reading {} blocks with a size of {}", id, to_read);
+                debug!("Reading the block ID {} with a size of {}", id, to_read);
                 let _ = input_file.read_exact(&mut data);
 
                 debug!("Setting the block info (compression and blocksize)");
@@ -180,6 +293,7 @@ pub fn decompressor(args: Args, mut input_file: File, mut output_file: File) -> 
                 }
 
                 // Send to the input channel
+                debug!("Sending the block ID {} to the workers", id);
                 tx_in
                     .send(MessageBlock {
                         id: id,
@@ -220,14 +334,22 @@ pub fn decompressor(args: Args, mut input_file: File, mut output_file: File) -> 
 
                 // Check if the received block is the expected one
                 if block.id == expected_id {
-                    debug!("Writing the block {} from queue", expected_id);
+                    debug!(
+                        "Writing {} bytes from the block {} from queue",
+                        block.data.len(),
+                        expected_id
+                    );
                     // If the order matches then write it to the file
                     let _ = output_file.write_all(&block.data);
                     expected_id += 1;
 
                     // Check if the next blocks are in the ordering buffer
                     while let Some(buffered_data) = out_of_order_buffer.remove(&expected_id) {
-                        debug!("Writing the block {} from the buffer", expected_id);
+                        debug!(
+                            "Writing {} bytes from the block {} from the buffer",
+                            buffered_data.data.len(),
+                            expected_id
+                        );
                         // If the next block was waiting in the buffer, then write it into the file
                         let _ = output_file.write_all(&buffered_data.data);
                         expected_id += 1;

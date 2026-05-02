@@ -47,6 +47,8 @@ fn main() {
     debug!("Block size: {}", args.block_size);
     debug!("HDL Fix: {}", args.hdl_fix);
 
+    info!("Starting the ZSO compressor/decompressor");
+
     // Check the input file existence
     debug!("Checking if the input file exists");
     let input_filename = args.input.clone();
