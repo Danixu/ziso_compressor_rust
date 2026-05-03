@@ -11,13 +11,25 @@ ZISO is a Rust-based multithreaded CSO/ZSO converter designed for fast compressi
 - HDL fix support for applications like `hdl_dump`
 - Release workflow for multiplatform builds
 
+## Comparison with previous implementation
+
+This version improves my other existing tool written in C++ at [Danixu/ziso_compressor](https://github.com/Danixu/ziso_compressor) in areas such as:
+
+- Multithreaded processing with better thread coordination
+- Cleaner worker/reader/writer separation
+- Improved error handling and cancellation
+- More consistent padding and index handling for ZSO files
+- Written in Rust for a better and safer resources usage.
+
+Future updates will add benchmark comparisons, but on the first tests this tool is about 5x-6x faster.
+
 ## Usage
 
 ```bash
-ziso [OPTIONS] <INPUT> [OUTPUT]
+ziso [OPTIONS] <INPUT> [OUTPUT]******
 ```
 
-### Arguments
+### Arguments******
 
 - `<INPUT>`: Input file path. Example: `game.iso`
 - `[OUTPUT]`: Optional output path. If omitted, the tool generates a file name using the appropriate extension (`.zso` for compression, `.iso` for decompression)
