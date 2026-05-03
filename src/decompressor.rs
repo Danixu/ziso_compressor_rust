@@ -84,11 +84,16 @@ pub fn decompressor(args: Args, input_file: File, output_file: File) -> Result<(
             "The first entry of the index table must match the compressed data start position: {}",
             (current_pos >> pos_shift) as u32
         ));
-    } else if index_table[index_table.len() - 1] != (real_file_size >> pos_shift) as u32 {
-        return Err(format!(
-            "The last entry of the index table must match the input file size: {}",
-            (real_file_size >> pos_shift) as u32
-        ));
+    } else {
+        let index_calculated_size = (index_table[index_table.len() - 1] as u64) << pos_shift;
+        let rounded_size = ((index_calculated_size + 2047) / 2048) * 2048;
+
+        if real_file_size != index_calculated_size && real_file_size != rounded_size {
+            return Err(format!(
+                "The file size doesn't matches the expected size in the index table: must be ({}) or the HDL fix size ({}): got {}",
+                index_calculated_size, rounded_size, real_file_size
+            ));
+        }
     }
 
     // A way to stop all the threads if any of them has failed
