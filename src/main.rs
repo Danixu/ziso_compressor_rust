@@ -12,6 +12,7 @@ use log::{debug, error, info, trace};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, Write};
 use std::thread;
+use types::LZ4_MAX_ACCELERATION;
 
 fn main() {
     // Initialize the logger
@@ -37,17 +38,11 @@ fn main() {
         })
         .init();
 
+    info!("Starting the ZSO compressor/decompressor");
+
     // Get the arguments
     debug!("Getting the program arguments");
     let args = Args::parse();
-    debug!("Force: {}", args.force);
-    debug!("Threads: {}", args.threads);
-    debug!("Compression level: {}", args.level);
-    debug!("Disable LZ4HC: {}", args.disable_hc);
-    debug!("Block size: {}", args.block_size);
-    debug!("HDL Fix: {}", args.hdl_fix);
-
-    info!("Starting the ZSO compressor/decompressor");
 
     // Check the input file existence
     debug!("Checking if the input file exists");
@@ -122,12 +117,33 @@ fn main() {
             );
             std::process::exit(1)
         });
+
+    // Print the arguments info
+    info!("Source: {:?}", input_filename);
+    info!("Destination: {:?}", output_filename);
+    info!("Force overwrite: {}", args.force);
+    info!("Block size: {} bytes", args.block_size);
+    info!("Number of threads: {}", args.threads);
+    info!("HDL fix: {}", args.hdl_fix);
+
     if compressed {
         if let Err(e) = decompressor(args, input_file, output_file) {
             error!("Decompression failed: {}", e);
             std::process::exit(1);
         }
     } else {
+        info!("Block size: {} bytes", args.block_size);
+        info!("Compression level: {}", args.level);
+        if args.disable_hc {
+            info!("LZ4 HC compression: Disabled");
+            info!(
+                "LZ4 acceleration: {}",
+                (LZ4_MAX_ACCELERATION - (args.level - 1) * LZ4_MAX_ACCELERATION / 11) as i32
+            );
+        } else {
+            info!("LZ4 HC compression: Enabled");
+            info!("LZ4 compression: {}", args.level);
+        }
         if let Err(e) = compressor(args, input_file, output_file) {
             error!("Compression failed: {}", e);
             std::process::exit(1);

@@ -1,5 +1,5 @@
 use super::args::Args;
-use super::types::{MessageBlock, QUEUE_SIZE, QUEUE_TRANSFER_SIZE};
+use super::types::{LZ4_MAX_ACCELERATION, MessageBlock, QUEUE_SIZE, QUEUE_TRANSFER_SIZE};
 use super::utils::{padding_calculator, u32_to_disk_u8};
 use log::{debug, error, info, trace};
 use lzzzz::{lz4, lz4_hc};
@@ -112,6 +112,12 @@ pub fn compressor(args: Args, input_file: File, output_file: File) -> Result<(),
     // Arc (Atomic Reference Counting) allows to share it between threads securely.
     let shared_rx_in = Arc::new(Mutex::new(rx_in));
 
+    // Map compression level (1-12) to LZ4 acceleration (2000-1)
+    // Level 1 = max acceleration (minimum compression), Level 12 = min acceleration (max compression)
+    let lz4_acceleration =
+        (LZ4_MAX_ACCELERATION - (args.level - 1) * LZ4_MAX_ACCELERATION / 11) as i32;
+    debug!("LZ4 acceleration set to {}", lz4_acceleration);
+
     // Initialize the workers (compression threads)
     debug!("Initializing the workers");
     let mut workers = vec![];
@@ -126,7 +132,6 @@ pub fn compressor(args: Args, input_file: File, output_file: File) -> Result<(),
             .name(format!("Worker-{}", i))
             .spawn(move || {
                 let mut comp_buffer = vec![0u8; lz4::max_compressed_size(args.block_size as usize)];
-                let lz4_acceleration = lz4::ACC_LEVEL_DEFAULT;
 
                 loop {
                     // If the kill_switch was activated, break the loop
@@ -375,11 +380,15 @@ pub fn compressor(args: Args, input_file: File, output_file: File) -> Result<(),
                             }
 
                             // Check if the next blocks are in the ordering buffer
-                            while let Some(buffered_data) = out_of_order_buffer.remove(&expected_id) {
+                            while let Some(buffered_data) = out_of_order_buffer.remove(&expected_id)
+                            {
                                 debug!("Writing the block {} from the buffer", expected_id);
                                 // If the next block was waiting in the buffer, then write it into the file
                                 if let Err(e) = output_file.write_all(&buffered_data.data) {
-                                    error!("Error writing buffered block {} to output file: {}", expected_id, e);
+                                    error!(
+                                        "Error writing buffered block {} to output file: {}",
+                                        expected_id, e
+                                    );
                                     writer_kill_switch.store(true, Ordering::Release);
                                     return;
                                 }
@@ -389,7 +398,8 @@ pub fn compressor(args: Args, input_file: File, output_file: File) -> Result<(),
                                 for i in 0..buffered_data.blocksize.len() {
                                     trace!("Generating the index entry {}", index_pos);
                                     // Set the position in the index
-                                    index_table[index_pos] = outfile_current_pos as u32 >> pos_shift;
+                                    index_table[index_pos] =
+                                        outfile_current_pos as u32 >> pos_shift;
                                     // Update the curren position with the new one
                                     outfile_current_pos += buffered_data.blocksize[i] as u64;
 
@@ -437,6 +447,31 @@ pub fn compressor(args: Args, input_file: File, output_file: File) -> Result<(),
                 error!("Error writing index table: {}", e);
                 return;
             }
+
+            // HDL Fix: Add padding to the output file if enabled and necessary
+            if args.hdl_fix {
+                let current_pos = match output_file.stream_position() {
+                    Ok(pos) => pos,
+                    Err(e) => {
+                        error!("Error getting output file position for HDL Fix: {}", e);
+                        return;
+                    }
+                };
+
+                if (current_pos % 2048) != 0 {
+                    let hdl_padding = 2048 - (current_pos % 2048);
+                    debug!(
+                        "HDL Fix: Adding {} bytes of padding to output file",
+                        hdl_padding
+                    );
+                    let padding = vec![0u8; hdl_padding as usize];
+                    if let Err(e) = output_file.write_all(&padding) {
+                        error!("Error writing HDL Fix padding: {}", e);
+                        return;
+                    }
+                }
+            }
+
             if let Err(e) = output_file.flush() {
                 error!("Error flushing output file: {}", e);
             }
