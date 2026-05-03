@@ -1,91 +1,119 @@
 # ZSO Format information
 
-ZSO is an alternative to the CSO version 1 format in the PSP. It uses the LZ4 compression algorithm instead the deflate algorithm to reduce the resources usage and improve the decompression speed, at cost of some compression ratio. This format was experimental but now can be considered as stable.
+ZSO is a custom compressed disc image format similar to CSO version 1. It uses LZ4-based blocks and an index table encoded with a shift value to support larger files.
 
-The format consist in a header, an index, and the data blocks. Additionally the "magic" bytes are **ZISO** and the preferred extension is **zso**.
+- Magic bytes: `ZISO`
+- Preferred extension: `.zso`
+- Header size: `24` bytes
+- Format version: `1`
+
+## File structure
+
+The file is composed of:
+
+1. Header
+2. Index table
+3. Data blocks
+4. Optional HDL padding at the end
 
 ## Header
 
-The main header is similar to the CSO version 1 header, and is composed by the following (little endian):
+The header is always `24` bytes and uses little-endian encoding.
 
-| Position | Type     | Size    | Default Value | Description                          |
-|----------|----------|---------|---------------|--------------------------------------|
-| 0x00     |   char   | 4 bytes |      ZISO     | Magic bytes. Always ZISO.            |
-| 0x04     | uint32_t | 4 bytes |      0x18     | The header size. Always 0x18.        |
-| 0x08     | uint64_t | 8 bytes |      N/A      | ISO original size                    |
-| 0x10     | uint32_t | 4 bytes |      N/A      | Block size. Usually 2048.            |
-| 0x14     | uint8_t  | 1 byte  |       1       | Version of the ZSO format. Always 1. |
-| 0x15     | uint8_t  | 1 byte  |      N/A      | Left shift of index values.          |
-| 0x16     | uint8_t  | 2 byte  |      N/A      | Unused.                              |
+| Offset | Size | Type     | Description |
+|-------:|------|----------|-------------|
+| `0x00` | 4    | `char[4]` | Magic bytes: `ZISO` |
+| `0x04` | 4    | `uint32`  | Header size: `24` |
+| `0x08` | 8    | `uint64`  | Original ISO size |
+| `0x10` | 4    | `uint32`  | Block size in bytes |
+| `0x14` | 1    | `uint8`   | Format version (`1`) |
+| `0x15` | 1    | `uint8`   | Position shift (`pos_shift`) |
+| `0x16` | 2    | reserved  | Reserved bytes, normally zero |
 
-## Index
+## Index table
 
-Following the header data there are the index entries. Those entries are composed by values in **uint32_t** (little endian), in which the **first byte (high byte)** indicates when the block is uncompressed, and the other **31 bits** are used to store the block position.
+The index table contains `N + 1` entries, where `N` is the number of data blocks.
 
-The number of index entries can be determined using the ISO original size and the Block size, using the following formula:
+- `N = ceil(original_size / block_size)`
+- The extra final entry is the EOF position for the last block
 
-```
-ceil(uncompressed_size / block_size) + 1
-```
+Each index entry is a `uint32` little-endian value.
 
-The extra block will be used to store the *EOF* position.
+### Index entry format
 
-As you will have noticed the 31 index bits limits the size to at most 2GB. This is not a problem in the PSP games because the UMD size is at most 1.8GB, but with bigger image files we will have to use the **shift** header entry.
+- Bit `31` (highest bit): `1` = uncompressed block, `0` = compressed block
+- Bits `0..30`: shifted block start position
 
-The shift value is the number of bits that we will shift right to be able to store the position into the 31 index bits, for example:
+The stored position is:
 
-```
-3.874.765.689 = 1110 0110 1111 0100 0011 1011 0111 1001
-```
-
-We will shift right the binary data:
-
-```
-0111 0011 0111 1010 0001 1101 1011 1100
+```text
+entry_position = block_offset >> pos_shift
 ```
 
-Now we have the 31 bits, but the problem is that there is a precission lost, so we will have to "ceil" the result:
+And the real file offset is recovered with:
 
-```
-0111 0011 0111 1010 0001 1101 1011 1100 = 1.937.382.844
-
-The last bit was 1, so we will "ceil" the number:
-
-1.937.382.844 + 1 = 1.937.382.845 = 0111 0011 0111 1010 0001 1101 1011 1101
+```text
+block_offset = entry_position << pos_shift
 ```
 
-Padding left the result will give us a new position, that we will have to use as real start point for the block data:
+The shift value is used so large offsets can still fit in a 31-bit field.
 
-```
-0111 0011 0111 1010 0001 1101 1011 1101 << 1 = 3.874.765.690
-3.874.765.690 - 3.874.765.689 = -1
-```
+### Position shift values
 
-The difference between the original block position and the correct position must be padded using any byte value (usually 0x00). In the above example with just paddin 1 the file will be padded to the closest even position, but with higher padding values will require more calculations.
+The tool chooses `pos_shift` based on original file size:
 
-A c++ example code to do the above:
+- `0` for files below `0x7FFFFFFF` (~2 GiB)
+- `1` for files below `0xFFFFFFFF` (~4 GiB)
+- `2` for files below `0x1FFFFFFFF` (~8 GiB)
+- `3` for files below `0x3FFFFFFFF` (~16 GiB)
+- `4` for larger files
 
-```
-void file_align(std::fstream &fOut, uint8_t shift)
-{
-    uint16_t paddingLostBytes = fOut.tellp() % (1 << shift);
-    if (paddingLostBytes)
-    {
-        uint16_t alignment = (1 << shift) - paddingLostBytes;
-        for (uint64_t i = 0; i < alignment; i++)
-        {
-            fOut.write("\0", 1);
-        }
-    }
-}
+### Example
+
+If `pos_shift = 1` and the raw offset is `0x12345678`, the stored index value is:
+
+```text
+entry_value = (0x12345678 >> 1)
 ```
 
-## Data
+To recover the offset:
 
-The data blocks consist in the LZ4 compressed data. To save some space we can store the RAW uncompressed data when the compressed data is bigger, setting the **uncompressed** bit in the index entry.
+```text
+offset = (entry_value << 1)
+```
 
-## LZ4HC
+## Data blocks
 
-The LZ4HC format must be compatible with the LZ4 decompressor, so we recommend to use it in the CSO format unless we detect any problem with it. Modern LZ4 libraries are able to decompress the LZ4HC without problem using the standard library, so modern emulators for sure will be compatible with LZ4HC format.
+Data blocks follow the index table and contain one or more compressed or raw blocks in file order.
 
-I personally recommend to keep it enabled unless we detect problems with our emulator.
+For each block:
+
+- Blocks are usually compressed with LZ4HC by default
+- If the compressed block is not smaller than the original block, the raw block is stored instead
+- The index bit `0x8000_0000` marks raw/uncompressed blocks
+- Block boundaries are inferred from consecutive index entries
+
+### Block padding and alignment
+
+Each stored block is padded to the nearest multiple of `1 << pos_shift`.
+
+This means:
+
+- The offset of each block starts at an aligned position
+- The index entry stores the aligned offset divided by `2^pos_shift`
+- The last entry in the index table marks the end-of-file offset
+
+When enabled, the final file is padded at the end to a full `2048`-byte boundary after the index table and data blocks are written. This is useful for compatibility with some HDL tools.
+
+## Compression mode
+
+Compression can be performed with LZ4HC by default, or with standard LZ4 acceleration in compatibility mode.
+
+The format supports decompression of both LZ4-compressed blocks and raw blocks.
+
+## Notes
+
+- The format is implemented specifically by this tool
+- `pos_shift` is not a generic LZ4 feature; it is part of the ZISO index encoding used here
+- The index stores absolute file offsets, not relative block sizes
+- The final index entry is required to compute the size of the last data block
