@@ -3,7 +3,8 @@ name = "ziso"
 version = "1.0.0"
 edition = "2024"
 authors = ["Daniel Carrasco"]
-description = "Multithread CSO converter written in Rust"
+description = "Multithread ZSO converter written in Rust"
+license = "Apache-2.0"
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
