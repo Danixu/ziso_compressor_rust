@@ -8,21 +8,19 @@ use args::Args;
 use clap::Parser;
 use compressor::compressor;
 use decompressor::decompressor;
-use log::{debug, error, info, trace};
+use log::{debug, info, trace};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, Write};
+use std::path::PathBuf;
 use std::thread;
 use types::LZ4_MAX_ACCELERATION;
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize the logger
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format(|buf, record| {
-            // Obtenemos el hilo actual que está emitiendo el log
             let current_thread = thread::current();
-            // Intentamos sacar el nombre. Si no tiene (como el main), ponemos "Main"
             let thread_name = current_thread.name().unwrap_or("Main");
-            // 1. Extraemos el nivel de log con sus colores ANSI originales
             let style = buf.default_level_style(record.level());
 
             writeln!(
@@ -40,99 +38,115 @@ fn main() {
 
     info!("Starting the ZSO compressor/decompressor");
 
-    // Get the arguments
-    debug!("Getting the program arguments");
     let args = Args::parse();
+    run(args)
+}
 
-    // Check the input file existence
-    debug!("Checking if the input file exists");
+fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    debug!("Getting the program arguments");
+
+    // Validate and open input file
     let input_filename = args.input.clone();
     debug!("Input file: {:?}", input_filename);
-    if !input_filename.exists() || !input_filename.is_file() {
-        error!(
-            "The input file {:?} doesn't exists or is not valid",
-            input_filename
-        );
-        std::process::exit(1);
-    }
-    debug!("Opening the input file as File");
-    let mut input_file = File::open(&input_filename).unwrap_or_else(|e| {
-        error!(
-            "Fatal error: The input file '{:?}' cannot be readed: {}",
-            input_filename, e
-        );
-        std::process::exit(1)
-    });
 
-    debug!("Checking if the input file is an already compressed ZSO");
-    let compressed: bool = {
-        let mut input_header: [u8; 4] = [0; 4];
+    let mut input_file = open_input_file(&input_filename)?;
 
-        input_file
-            .read_exact(&mut input_header)
-            .unwrap_or_else(|e| {
-                error!("Fatal error: Cannot read the input file header: {}", e);
-                std::process::exit(1)
-            });
-
-        trace!("Input file header: {:?}", &input_header);
-
-        &input_header == b"ZISO"
-    };
+    // Determine if file is compressed by checking header
+    let compressed = is_compressed_file(&mut input_file)?;
     debug!("Compressed?: {}", compressed);
 
-    trace!("Rewind the file to the start point");
-    let _ = input_file
-        .seek(std::io::SeekFrom::Start(0))
-        .unwrap_or_else(|e| {
-            error!("Fatal error: Cannot rewind the input file: {}", e);
-            std::process::exit(1)
-        });
-
-    // If the output is empty, then generate the filename based in the input
-    debug!("Checking if the output file exists");
+    // Generate output filename if not provided
     let output_filename = args
         .output
         .clone()
         .unwrap_or_else(|| input_filename.with_extension(if compressed { "iso" } else { "zso" }));
     debug!("Output file: {:?}", output_filename);
-    // Check the output file existence and if must be overwritten
-    if (output_filename.exists() && output_filename.is_file()) && !args.force {
-        error!(
-            "The output file {:?} exists and no force flag was provided",
-            output_filename
-        );
-        std::process::exit(1);
+
+    // Validate output file
+    validate_output_file(&output_filename, args.force)?;
+
+    // Open output file
+    let output_file = open_output_file(&output_filename)?;
+
+    // Print operation info
+    print_operation_info(&args, &input_filename, &output_filename, compressed);
+
+    // Execute compression or decompression
+    if compressed {
+        decompressor(args, input_file, output_file)?;
+    } else {
+        compressor(args, input_file, output_file)?;
     }
+
+    Ok(())
+}
+
+fn open_input_file(filename: &PathBuf) -> Result<File, Box<dyn std::error::Error>> {
+    if !filename.exists() || !filename.is_file() {
+        return Err(format!(
+            "The input file {:?} doesn't exist or is not valid",
+            filename
+        )
+        .into());
+    }
+
+    debug!("Opening the input file as File");
+    File::open(filename).map_err(|e| format!("Cannot open input file {:?}: {}", filename, e).into())
+}
+
+fn is_compressed_file(file: &mut File) -> Result<bool, Box<dyn std::error::Error>> {
+    debug!("Checking if the input file is an already compressed ZSO");
+
+    let mut input_header: [u8; 4] = [0; 4];
+    file.read_exact(&mut input_header)
+        .map_err(|e| format!("Cannot read the input file header: {}", e))?;
+
+    trace!("Input file header: {:?}", &input_header);
+
+    let compressed = &input_header == b"ZISO";
+
+    // Rewind file to start
+    trace!("Rewind the file to the start point");
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(|e| format!("Cannot rewind the input file: {}", e))?;
+
+    Ok(compressed)
+}
+
+fn validate_output_file(filename: &PathBuf, force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    debug!("Checking if the output file exists");
+
+    if filename.exists() && filename.is_file() && !force {
+        return Err(format!(
+            "The output file {:?} exists and no force flag was provided",
+            filename
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+fn open_output_file(filename: &PathBuf) -> Result<File, Box<dyn std::error::Error>> {
     debug!("Opening the output file as File in write mode and truncate");
-    let output_file = OpenOptions::new()
+
+    OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .open(&output_filename)
-        .unwrap_or_else(|e| {
-            error!(
-                "Fatal error: Output file '{:?}' cannot be written: {}",
-                output_filename, e
-            );
-            std::process::exit(1)
-        });
+        .open(filename)
+        .map_err(|e| format!("Cannot open output file {:?}: {}", filename, e).into())
+}
 
-    // Print the arguments info
-    info!("Source: {:?}", input_filename);
-    info!("Destination: {:?}", output_filename);
+fn print_operation_info(args: &Args, input: &PathBuf, output: &PathBuf, compressed: bool) {
+    info!("Source: {:?}", input);
+    info!("Destination: {:?}", output);
     info!("Force overwrite: {}", args.force);
     info!("Block size: {} bytes", args.block_size);
     info!("Number of threads: {}", args.threads);
     info!("HDL fix: {}", args.hdl_fix);
 
-    if compressed {
-        if let Err(e) = decompressor(args, input_file, output_file) {
-            error!("Decompression failed: {}", e);
-            std::process::exit(1);
-        }
-    } else {
-        info!("Block size: {} bytes", args.block_size);
+    if !compressed {
         info!("Compression level: {}", args.level);
         if args.disable_hc {
             info!("LZ4 HC compression: Disabled");
@@ -144,10 +158,5 @@ fn main() {
             info!("LZ4 HC compression: Enabled");
             info!("LZ4 compression: {}", args.level);
         }
-        if let Err(e) = compressor(args, input_file, output_file) {
-            error!("Compression failed: {}", e);
-            std::process::exit(1);
-        }
     }
-    ()
 }
