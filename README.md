@@ -11,6 +11,24 @@ ZISO is a Rust-based multithreaded CSO/ZSO converter designed for fast compressi
 - HDL fix support for applications like `hdl_dump`
 - Release workflow for multiplatform builds
 
+## Download
+
+Download the latest binaries for your platform from the [GitHub releases page](https://github.com/Danixu/ziso_compressor/releases/latest):
+
+- **Linux x86_64 (MUSL)** - `ziso-linux-x86_64-musl.zip`
+- **Linux x86_64 (glibc)** - `ziso-linux-x86_64-gnu.zip`
+- **Windows x64** - `ziso-windows-x64.zip`
+- **macOS ARM64** - `ziso-macos-arm64.zip`
+- **macOS x64** - `ziso-macos-x64.zip`
+
+### ⚠️ Note on MUSL vs glibc builds
+
+The MUSL build is statically linked and more portable, but **significantly slower** than the glibc version. If you're using Linux with glibc (the default on most distributions), we strongly recommend using the glibc build for better performance. The glibc version offers **up to 12x better performance** due to optimized memory allocation, system call handling, and lz4 compressor optimizations. Tests on an i7-1355U show approximately 9 seconds with the glibc version vs 80 seconds with the MUSL version.
+
+**Recommendation:**
+- Use **glibc build** if available on your system (faster, recommended)
+- Use **MUSL build** only if you need portability across different Linux distributions
+
 ## Comparison with previous implementation
 
 This version improves my other existing tool written in C++ at [Danixu/ziso_compressor](https://github.com/Danixu/ziso_compressor) in areas such as:
@@ -21,7 +39,13 @@ This version improves my other existing tool written in C++ at [Danixu/ziso_comp
 - More consistent padding and index handling for ZSO files
 - Written in Rust for a better and safer resources usage.
 
-Future updates will add benchmark comparisons, but on the first tests this tool is about 5x-6x faster.
+### Original c++ ziso vs rust ziso
+
+This tests were made using the original ziso version built in C++ (single threaded) and this rust version of the ziso compressor (multithread glibc).
+
+| PS2 Disk   | Original Size | Compressed Size | C++ ziso time | Rust ziso time |
++------------+---------------+-----------------+---------------+----------------+
+| 24 - The Game | 5931 MB | 403 MB | 59.40 | 10.90s |
 
 ## Usage
 
@@ -115,6 +139,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 The repository includes a GitHub Actions workflow that triggers on new tags matching `v*`. It builds release binaries for:
 
 - Linux x86_64 MUSL
+- Linux x86_64 glibc
 - Windows x64
 - macOS ARM64
 - macOS x64

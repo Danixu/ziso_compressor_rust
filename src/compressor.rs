@@ -221,11 +221,14 @@ pub fn compressor(args: Args, input_file: File, output_file: File) -> Result<(),
                                 if padding_needed > 0 {
                                     trace!("Padding the block with {} bytes", padding_needed);
                                     out_message.blocksize[i] += padding_needed as u32;
+                                    let data_size = out_message.data.len() + padding_needed;
                                     out_message
                                         .data
-                                        .resize(out_message.blocksize[i] as usize, 0);
+                                        .resize(data_size, 0);
                                 }
                             }
+
+                            debug!("Finished processing the block {} with a size {}. Sending to the output queue...", out_message.id, out_message.data.len());
 
                             // Send the compressed data to the output queue to be processed by the writer.
                             let sent = tx.send(out_message);
@@ -354,7 +357,7 @@ pub fn compressor(args: Args, input_file: File, output_file: File) -> Result<(),
                     Ok(block) => {
                         // Check if the received block is the expected one
                         if block.id == expected_id {
-                            debug!("Writing the block {} from queue", expected_id);
+                            debug!("Writing the block {} from queue with size {}", expected_id, block.data.len());
                             // If the order matches then write it to the file
                             if let Err(e) = output_file.write_all(&block.data) {
                                 error!("Error writing block {} to output file: {}", expected_id, e);
@@ -367,7 +370,7 @@ pub fn compressor(args: Args, input_file: File, output_file: File) -> Result<(),
                             for i in 0..block.blocksize.len() {
                                 trace!("Generating the index entry {}", index_pos);
                                 // Set the position in the index
-                                index_table[index_pos] = outfile_current_pos as u32 >> pos_shift;
+                                index_table[index_pos] = (outfile_current_pos >> pos_shift) as u32;
                                 // Update the curren position with the new one
                                 outfile_current_pos += block.blocksize[i] as u64;
 
@@ -376,13 +379,16 @@ pub fn compressor(args: Args, input_file: File, output_file: File) -> Result<(),
                                     index_table[index_pos] |= 0x80000000;
                                 }
 
+                                trace!("Added a block of size {} to the output file. Current position is {}", block.blocksize[i], outfile_current_pos);
+                                trace!("Current index entry {}: {:08X}", index_pos, index_table[index_pos]);
+
                                 index_pos += 1;
                             }
 
                             // Check if the next blocks are in the ordering buffer
                             while let Some(buffered_data) = out_of_order_buffer.remove(&expected_id)
                             {
-                                debug!("Writing the block {} from the buffer", expected_id);
+                                debug!("Writing the block {} from the buffer with size {}", expected_id, buffered_data.data.len());
                                 // If the next block was waiting in the buffer, then write it into the file
                                 if let Err(e) = output_file.write_all(&buffered_data.data) {
                                     error!(
@@ -398,8 +404,7 @@ pub fn compressor(args: Args, input_file: File, output_file: File) -> Result<(),
                                 for i in 0..buffered_data.blocksize.len() {
                                     trace!("Generating the index entry {}", index_pos);
                                     // Set the position in the index
-                                    index_table[index_pos] =
-                                        outfile_current_pos as u32 >> pos_shift;
+                                    index_table[index_pos] = (outfile_current_pos >> pos_shift) as u32;
                                     // Update the curren position with the new one
                                     outfile_current_pos += buffered_data.blocksize[i] as u64;
 
@@ -407,6 +412,9 @@ pub fn compressor(args: Args, input_file: File, output_file: File) -> Result<(),
                                     if !buffered_data.compressed[i] {
                                         index_table[index_pos] |= 0x80000000;
                                     }
+
+                                    trace!("Added a block of size {} to the output file. Current position is {}", buffered_data.blocksize[i], outfile_current_pos);
+                                    trace!("Current index entry {}: {:08X}", index_pos, index_table[index_pos]);
 
                                     index_pos += 1;
                                 }
@@ -433,7 +441,7 @@ pub fn compressor(args: Args, input_file: File, output_file: File) -> Result<(),
             }
 
             // Set the last block position as EOF
-            index_table[index_pos] = outfile_current_pos as u32 >> pos_shift;
+            index_table[index_pos] = (outfile_current_pos >> pos_shift) as u32;
 
             // Rewind to the index position
             if let Err(e) = output_file.seek(SeekFrom::Start(24)) {
