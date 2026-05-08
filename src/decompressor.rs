@@ -153,7 +153,7 @@ pub fn decompressor(args: Args, input_file: File, output_file: File) -> Result<(
 
                     debug!("Received a message. Processing...");
                     let blocks_number: usize = message.compressed.len();
-                    debug!("Processing {} blocks", blocks_number);
+                    debug!("Processing the block id {} with {} blocks", message.id, blocks_number);
                     let mut out_message = MessageBlock {
                         id: message.id,
                         compressed: Vec::new(),
@@ -173,7 +173,7 @@ pub fn decompressor(args: Args, input_file: File, output_file: File) -> Result<(
 
                         if message.compressed[i] {
                             trace!("Decompressing using LZ4");
-                            match lz4::decompress(comp_data, &mut decomp_buffer) {
+                            match lz4::decompress_partial(comp_data, &mut decomp_buffer, block_size as usize) {
                                 Ok(decomp_size) => {
                                     trace!(
                                         "The block was decompressed successfully with a size of {}.",
@@ -198,6 +198,7 @@ pub fn decompressor(args: Args, input_file: File, output_file: File) -> Result<(
                         current_data_offset += message.blocksize[i] as usize;
                     }
 
+                    debug!("Finished processing the block id {}. Sending to the output queue...", out_message.id);
                     match tx.send(out_message) {
                         Ok(_) => {}
                         Err(_) => {
@@ -254,10 +255,10 @@ pub fn decompressor(args: Args, input_file: File, output_file: File) -> Result<(
                     current_block + readable_blocks
                 );
                 let starting_position =
-                    (index_table[current_block] << pos_shift) as usize & 0x7FFFFFFF;
-                let ending_position = (index_table[current_block + readable_blocks] << pos_shift)
-                    as usize
-                    & 0x7FFFFFFF;
+                    ((index_table[current_block] & 0x7FFFFFFF) as usize) << pos_shift;
+                let ending_position = ((index_table[current_block + readable_blocks] & 0x7FFFFFFF)
+                    as usize)
+                    << pos_shift;
 
                 debug!("Starting position: {}", starting_position);
                 debug!("Ending position: {}", ending_position);
@@ -281,9 +282,11 @@ pub fn decompressor(args: Args, input_file: File, output_file: File) -> Result<(
                     cb_compressed[i] = (index_table[current_block + i] & 0x80000000) == 0;
 
                     // Calculate the block size
-                    let start_offset_raw = index_table[current_block + i] & 0x7FFFFFFF;
-                    let end_offset_raw = index_table[current_block + i + 1] & 0x7FFFFFFF;
-                    cb_blocksize[i] = end_offset_raw - start_offset_raw;
+                    let start_offset_raw: u64 =
+                        ((index_table[current_block + i] & 0x7FFFFFFF) as u64) << pos_shift;
+                    let end_offset_raw: u64 =
+                        ((index_table[current_block + i + 1] & 0x7FFFFFFF) as u64) << pos_shift;
+                    cb_blocksize[i] = (end_offset_raw - start_offset_raw) as u32;
                 }
 
                 // Send to the input channel with better error handling
