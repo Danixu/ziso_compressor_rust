@@ -6,7 +6,7 @@ use lzzzz::lz4;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self};
 use std::time::Duration;
@@ -99,6 +99,65 @@ pub fn decompressor(args: Args, input_file: File, output_file: File) -> Result<(
     // A way to stop all the threads if any of them has failed
     let kill_switch = Arc::new(AtomicBool::new(false));
 
+    // Contador de bloques procesados para el progreso
+    let processed_blocks = Arc::new(AtomicUsize::new(0));
+    // Contadores de bytes para calcular el ratio de compresión
+    let compressed_bytes = Arc::new(AtomicU64::new(0));
+    let original_bytes = Arc::new(AtomicU64::new(0));
+    // Kill switch para el hilo de reporte
+    let reporter_kill_switch = Arc::new(AtomicBool::new(false));
+
+    // Hilo para reportar el progreso
+    let reporter_processed_blocks = Arc::clone(&processed_blocks);
+    let reporter_compressed_bytes = Arc::clone(&compressed_bytes);
+    let reporter_original_bytes = Arc::clone(&original_bytes);
+    let reporter_total_blocks = (index_table.len() - 1) as usize;
+    let reporter_kill_switch_clone = Arc::clone(&reporter_kill_switch);
+    let reporter_thread = thread::spawn(move || {
+        let mut last_percentage = 0;
+        loop {
+            if reporter_kill_switch_clone.load(Ordering::Relaxed) {
+                // Asegurarse de que se imprima el 100% antes de terminar
+                let final_comp = reporter_compressed_bytes.load(Ordering::Relaxed);
+                let final_orig = reporter_original_bytes.load(Ordering::Relaxed);
+                let ratio = if final_comp > 0 {
+                    (final_comp as f64 / final_orig as f64) * 100.0
+                } else {
+                    0.0
+                };
+                print!("\rProcessed: 100% | Compression ratio: {:.2}%", ratio);
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                println!(); // Nueva línea al final
+                break;
+            }
+            let current_processed = reporter_processed_blocks.load(Ordering::Relaxed);
+            let percentage = if current_processed >= reporter_total_blocks {
+                100
+            } else {
+                (current_processed * 100) / reporter_total_blocks
+            };
+
+            let comp = reporter_compressed_bytes.load(Ordering::Relaxed);
+            let orig = reporter_original_bytes.load(Ordering::Relaxed);
+            let ratio = if comp > 0 {
+                (comp as f64 / orig as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            if percentage > last_percentage {
+                print!(
+                    "\rProcessed: {}% | Compression ratio: {:.2}%",
+                    percentage, ratio
+                );
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                last_percentage = percentage;
+            }
+
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+
     // We get the max number of blocks to read. In case that they are uncompressed, will almost fit the buffer.
     // Will keep the size under control in the output buffer
     let queue_max_blocks: usize = QUEUE_TRANSFER_SIZE / args.block_size as usize;
@@ -121,6 +180,11 @@ pub fn decompressor(args: Args, input_file: File, output_file: File) -> Result<(
         let tx = tx_out.clone();
         // Clone the kill_switch
         let worker_kill_switch = kill_switch.clone();
+        // Clone the processed_blocks counter
+        let worker_processed_blocks = Arc::clone(&processed_blocks);
+        // Clone the byte counters for compression ratio
+        let worker_compressed_bytes = Arc::clone(&compressed_bytes);
+        let worker_original_bytes = Arc::clone(&original_bytes);
 
         debug!("Spawning the new thread");
         let worker: Result<thread::JoinHandle<()>, std::io::Error> = thread::Builder::new()
@@ -180,6 +244,9 @@ pub fn decompressor(args: Args, input_file: File, output_file: File) -> Result<(
                                         decomp_size
                                     );
                                     out_message.data.extend_from_slice(&decomp_buffer[..decomp_size]);
+                                    // Update byte counters
+                                    worker_compressed_bytes.fetch_add(message.blocksize[i] as u64, Ordering::Relaxed);
+                                    worker_original_bytes.fetch_add(decomp_size as u64, Ordering::Relaxed);
                                 }
                                 Err(reason) => {
                                     error!(
@@ -193,8 +260,13 @@ pub fn decompressor(args: Args, input_file: File, output_file: File) -> Result<(
                         } else {
                             trace!("Copying the uncompressed data");
                             out_message.data.extend_from_slice(comp_data);
+                            // Update byte counters
+                            worker_compressed_bytes.fetch_add(message.blocksize[i] as u64, Ordering::Relaxed);
+                            worker_original_bytes.fetch_add(comp_data.len() as u64, Ordering::Relaxed);
                         }
 
+                        // Update processed blocks counter
+                        worker_processed_blocks.fetch_add(1, Ordering::Relaxed);
                         current_data_offset += message.blocksize[i] as usize;
                     }
 
@@ -436,6 +508,10 @@ pub fn decompressor(args: Args, input_file: File, output_file: File) -> Result<(
             return Err("Writer thread panicked".to_string());
         }
     }
+
+    // Ensure the reporter thread is stopped
+    reporter_kill_switch.store(true, Ordering::Relaxed);
+    reporter_thread.join().unwrap();
 
     info!("File decompressed succesfully!");
 
