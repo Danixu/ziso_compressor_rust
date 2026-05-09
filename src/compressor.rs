@@ -597,6 +597,11 @@ pub fn compressor(args: Args, input_file: File, output_file: File) -> Result<(),
     reporter_kill_switch.store(true, Ordering::Relaxed);
     reporter_thread.join().unwrap();
 
+    // Check if any thread failed during processing
+    if kill_switch.load(Ordering::Relaxed) {
+        return Err("Compression failed due to an error in one of the worker threads".to_string());
+    }
+
     info!("File compressed succesfully!");
 
     Ok(())
