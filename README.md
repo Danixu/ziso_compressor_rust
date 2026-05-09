@@ -39,13 +39,33 @@ This version improves my other existing tool written in C++ at [Danixu/ziso_comp
 - More consistent padding and index handling for ZSO files
 - Written in Rust for a better and safer resources usage.
 
-### Original c++ ziso vs rust ziso
+## Benchmarks: Original C++ ZISO vs Rust ZISO
 
-This tests were made using the original ziso version built in C++ (single threaded) and this rust version of the ziso compressor (multithread glibc).
+These benchmarks compare the original single-threaded C++ implementation with this multithreaded Rust version compiled with glibc. Testing was performed on a Slimbook Elemental 15 with an Intel i7-1355U processor and 32GB RAM running Kubuntu 26.04. Each benchmark was run 3 times and the best result is reported. The speedup column shows the performance improvement ratio of the Rust version over the C++ version.
 
-| PS2 Disk   | Original Size | Compressed Size | C++ ziso time | Rust ziso time |
-+------------+---------------+-----------------+---------------+----------------+
-| 24 - The Game | 5931 MB | 403 MB | 59.40 | 10.90s |
+### Compression
+
+| PS2 Game Title | Original Size | Compressed Size | C++ ZISO Time | Rust ZISO Time | Speedup |
+|----------------|---------------|-----------------|---------------|----------------|---------|
+| 24 - The Game | 5.8GB | 5.2GB | 59.40s | 10.90s | 5.4x |
+| Arcade Action - 30 Games | 358MB | 290MB | 4.50s | 0.81s | 5.6x |
+| Arcade Classics Volume 1 | 188MB | 165MB | 2.41s | 0.50s | 4.8x |
+| Armored Core - Last Raven | 3.8GB | 3.2GB | 37.65s | 6.61s | 5.7x |
+| Armored Core - Nexus (Disc 1) | 4.3GB | 3.6GB | 41.96s | 8.66s | 4.8x |
+| Silent Line - Armored Core | 1.8GB | 1.4GB | 25.42s | 4.19s | 6.1x |
+
+### Decompression
+
+| PS2 Game Title | Original Size | C++ ZISO Time | Rust ZISO Time | Speedup |
+|----------------|---------------|---------------|----------------|---------|
+| 24 - The Game | 5.8GB | 4.77s | 3.46s | 1.38x |
+| Arcade Action - 30 Games | 358MB | 0.26s | 0.33s | 0.8x |
+| Arcade Classics Volume 1 | 188MB | 0.14s | 0.18s | 0.8x |
+| Armored Core - Last Raven | 3.8GB | 3.39s | 2.00s | 1.7x |
+| Armored Core - Nexus (Disc 1) | 4.3GB | 3.88s | 2.31s | 1.7x |
+| Silent Line - Armored Core | 1.8GB | 1.48s | 0.97s | 1.5x |
+
+In this case the bottleneck is the NVME disk, so with small files the threads overhead is bigger than the performance improvement.
 
 ## Usage
 

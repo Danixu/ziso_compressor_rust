@@ -169,8 +169,14 @@ pub fn compressor(args: Args, input_file: File, output_file: File) -> Result<(),
                             for i in 0..blocks_number {
                                 trace!("Working on block {}", i);
                                 // Reference the block
+                                let current_block_size = if i == blocks_number - 1 {
+                                    // The last block can be smaller than the block size, so we need to calculate the real size.
+                                    message.data.len() - (i * args.block_size as usize)
+                                } else {
+                                    args.block_size as usize
+                                };
                                 let raw_block: &[u8] = &message.data[(i * args.block_size as usize)
-                                    ..((i + 1) * args.block_size as usize)];
+                                    ..((i * args.block_size as usize) + current_block_size)];
 
                                 // Compress the block
                                 let res = if args.disable_hc {
