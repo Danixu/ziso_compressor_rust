@@ -58,7 +58,7 @@ These benchmarks compare the original single-threaded C++ implementation with th
 
 | PS2 Game Title | Original Size | C++ ZISO Time | Rust ZISO Time | Speedup |
 |----------------|---------------|---------------|----------------|---------|
-| 24 - The Game | 5.8GB | 4.77s | 3.46s | 1.38x |
+| 24 - The Game | 5.8GB | 4.77s | 3.46s | 1.4x |
 | Arcade Action - 30 Games | 358MB | 0.26s | 0.33s | 0.8x |
 | Arcade Classics Volume 1 | 188MB | 0.14s | 0.18s | 0.8x |
 | Armored Core - Last Raven | 3.8GB | 3.39s | 2.00s | 1.7x |
@@ -175,7 +175,3 @@ Apache License 2.0
 ### 1.0.0
 
 - Initial release of `ziso`.
-- Added multithreaded ZSO compression and decompression.
-- Added LZ4 compression level control and optional `--nohc` mode.
-- Added `--block-size` support and HDL fix alignment.
-- Added GitHub Actions release workflow.
